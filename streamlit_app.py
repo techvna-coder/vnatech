@@ -93,10 +93,7 @@ def auth_gate() -> Tuple[bool, str]:
         st.error("No users configured under [auth.users].")
         st.stop()
 
-    # Build credentials for v0.3.x
-    # chấp nhận 2 kiểu secrets:
-    #  - [auth.users.admin] name=.. username=.. password=..
-    #  - [auth.users.user1] name=.. username=.. password=..
+    # Build credentials dict (API v0.3+)
     credentials = {"usernames": {}}
     for _, u in users.items():
         uname = u.get("username")
@@ -106,27 +103,32 @@ def auth_gate() -> Tuple[bool, str]:
             "name": u.get("name", uname),
             "password": u.get("password", ""),  # bcrypt hash
         }
-
     if not credentials["usernames"]:
-        st.error("No valid users in [auth.users]. Each user must have 'username' and 'password' (bcrypt).")
+        st.error("No valid users in [auth.users]. Each user needs 'username' and bcrypt 'password'.")
         st.stop()
 
-    # v0.3.x API:
-    # Authenticate(credentials, cookie_name, key, cookie_expiry_days, preauthorized=None)
+    # Instantiate (API v0.3+)
     authenticator = stauth.Authenticate(
         credentials,
         cookie_name,
         cookie_key,
-        cookie_expiry_days
+        cookie_expiry_days,
     )
 
-    # login(form_name, location)
-    name, auth_status, username = authenticator.login('main', fields={
-    'Form name': 'Đăng nhập',
-    'Username': 'Username',
-    'Password': 'Password',
-    'Login': 'Login'
-})
+    # Call .login with best-effort compatibility across versions
+    name = None
+    auth_status = None
+    username = None
+    try:
+        # Newer API (0.3.x–0.4.x): first positional arg is location
+        name, auth_status, username = authenticator.login('main')
+    except TypeError:
+        try:
+            # Some builds accept keyword 'location'
+            name, auth_status, username = authenticator.login(location='main')
+        except TypeError:
+            # Legacy API (0.2.x): login(form_name, location)
+            name, auth_status, username = authenticator.login('Login', 'main')
 
     if auth_status:
         with st.sidebar:
