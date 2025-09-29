@@ -73,7 +73,7 @@ EMBEDDINGS_FILE = "embeddings_meta.pkl"
 FAISS_INDEX_FILE = "faiss_index.bin"
 TOP_K = 10
 
-st.set_page_config(page_title="VNA Tech RAG", layout="wide")
+st.set_page_config(page_title="VNA Tech", layout="wide")
 
 
 # =========================
@@ -117,7 +117,7 @@ def login_gate() -> Tuple[bool, str, str]:
         return True, u, display_name
 
     with st.form("login_form", clear_on_submit=False):
-        st.subheader("Đăng nhập để truy cập VNA Tech RAG")
+        st.subheader("Đăng nhập để truy cập VNA Techinsight Hub ")
         username = st.text_input("Username")
         password = st.text_input("Password", type="password")
         submitted = st.form_submit_button("Login")
@@ -324,7 +324,7 @@ def _ask_llm(client: OpenAI, question: str, chunks: List[Dict[str, Any]]) -> str
 # UI
 # =========================
 def sidebar_panel(index, meta):
-    st.sidebar.header("VNA Tech – RAG")
+    st.sidebar.header("VNA Techinsight")
     with st.sidebar.expander("Bộ nhớ đệm", expanded=True):
         st.write("- **Embeddings**: `%s`" % EMBEDDINGS_FILE)
         st.write("- **FAISS index**: `%s`" % FAISS_INDEX_FILE)
@@ -368,7 +368,7 @@ def main():
     if not ok:
         st.stop()
 
-    st.title("VNA Tech Streamlit RAG App")
+    st.title("VNA TechInsight Hub")
     st.caption("Truy vấn trực tiếp các tài liệu PDF/PPTX trong Google Drive.")
 
     api_key = st.secrets.get("OPENAI_API_KEY")
