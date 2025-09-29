@@ -1,5 +1,5 @@
 import streamlit as st
-import OpenAI
+from openai import OpenAI
 import numpy as np
 import pandas as pd
 import pickle
@@ -13,8 +13,8 @@ from io import BytesIO
 from drive_utils import authenticate_drive, list_files_in_folder, download_file
 from document_processors import process_pdf, process_pptx, chunk_text, get_embeddings
 
-# Configure OpenAI
-openai.api_key = st.secrets["OPENAI_API_KEY"]
+# Initialize OpenAI client
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 # Constants
 DRIVE_FOLDER_ID = st.secrets["DRIVE_FOLDER_ID"]
@@ -80,7 +80,7 @@ Question: {query}
 Answer:"""
     
     try:
-        response = openai.chat.completions.create(
+        response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that answers questions based on provided context. Be precise and cite relevant information from the context when possible."},
