@@ -128,7 +128,7 @@ def login_gate() -> Tuple[bool, str, str]:
             st.session_state["auth_user"] = username
             st.session_state["auth_name"] = creds[username]["name"]
             st.success("Đăng nhập thành công.")
-            st.experimental_rerun()
+            st.rerun()
         else:
             st.error("Sai username hoặc password.")
 
@@ -141,7 +141,7 @@ def logout_button():
                 if k in st.session_state:
                     del st.session_state[k]
             st.success("Đã đăng xuất.")
-            st.experimental_rerun()
+            st.rerun()
 
 
 # =========================
