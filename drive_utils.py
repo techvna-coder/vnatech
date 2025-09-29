@@ -1,309 +1,179 @@
-import streamlit as st
-import json
-import ssl
-import certifi
-import time
+# Write a complete drive_utils.py with robust upload (update-or-create), listing, download,
+# and authentication via Service Account from Streamlit secrets.
+from pathlib import Path
+
+drive_utils_code = r"""
+import io
 import os
-from typing import Tuple
+import time
+from typing import List, Dict, Any, Optional
+
+import streamlit as st
+
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, HttpError
-from typing import List, Dict, Any
-from io import BytesIO
+from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 
+# ============================
+# Authentication
+# ============================
+
+# Default scopes:
+# - drive: full access (upload/update/list)
+# - drive.readonly: safe fallback for read-only operations (not used by default)
+SCOPES = [
+    "https://www.googleapis.com/auth/drive",
+]
+
+@st.cache_resource(show_spinner=False)
 def authenticate_drive():
-    """Authenticate with Google Drive using service account credentials."""
-    try:
-        # Get service account JSON from secrets
-        service_account_json = st.secrets["GOOGLE_SERVICE_ACCOUNT_JSON"]
-        
-        # Parse JSON string to dict
-        if isinstance(service_account_json, str):
-            service_account_dict = json.loads(service_account_json)
-        else:
-            service_account_dict = service_account_json
-        
-        # Fix private key newlines if necessary
-        if 'private_key' in service_account_dict:
-            service_account_dict['private_key'] = service_account_dict['private_key'].replace('\\n', '\n')
-        
-        # Create credentials
-        credentials = service_account.Credentials.from_service_account_info(
-            service_account_dict,
-            scopes=['https://www.googleapis.com/auth/drive.readonly']
-        )
-        
-        # Build the Drive service directly with credentials
-        service = build('drive', 'v3', credentials=credentials, cache_discovery=False)
-        
-        return service
-        
-    except Exception as e:
-        raise Exception(f"Failed to authenticate with Google Drive: {str(e)}")
+    \"\"\"Authenticate to Google Drive using a Service Account from Streamlit secrets.
+    Expected in .streamlit/secrets.toml:
+        GOOGLE_SERVICE_ACCOUNT_JSON = \"\"\"{ ... }\"\"\"  # JSON string
+    \"\"\"
+    sa_json = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON", None)
+    if not sa_json:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is missing in secrets.")
 
-def list_files_in_folder(service, folder_id: str, max_retries: int = 3) -> List[Dict[str, Any]]:
-    """List all PDF and PPTX files in a Google Drive folder with retry logic."""
-    for attempt in range(max_retries):
+    # Accept either a JSON string or a dict-like
+    if isinstance(sa_json, str):
+        import json
         try:
-            # Query for PDF and PPTX files in the specified folder
-            query = f"'{folder_id}' in parents and (mimeType='application/pdf' or mimeType='application/vnd.openxmlformats-officedocument.presentationml.presentation') and trashed=false"
-            
-            results = service.files().list(
-                q=query,
-                fields="files(id, name, mimeType, size, modifiedTime)",
-                pageSize=100
-            ).execute()
-            
-            files = results.get('files', [])
-            
-            formatted_files = []
-            for file in files:
-                formatted_files.append({
-                    'id': file['id'],
-                    'name': file['name'],
-                    'mimeType': file['mimeType'],
-                    'size': file.get('size', 'Unknown'),
-                    'modifiedDate': file.get('modifiedTime', 'Unknown')
-                })
-            
-            # Sort files by name
-            formatted_files.sort(key=lambda x: x['name'].lower())
-            
-            return formatted_files
-            
-        except (ssl.SSLError, ConnectionError) as e:
-            if attempt < max_retries - 1:
-                st.warning(f"Connection issue (attempt {attempt + 1}/{max_retries}), retrying...")
-                time.sleep(2 ** attempt)  # Exponential backoff
-                continue
-            else:
-                raise Exception(f"Failed after {max_retries} attempts: {str(e)}")
+            sa_info = json.loads(sa_json)
+        except Exception as e:
+            raise RuntimeError(f"Invalid GOOGLE_SERVICE_ACCOUNT_JSON: {e}")
+    elif isinstance(sa_json, dict):
+        sa_info = sa_json
+    else:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON must be a JSON string or dict.")
+
+    # Normalize private_key newlines if provided as escaped \\n
+    if "private_key" in sa_info and isinstance(sa_info["private_key"], str):
+        sa_info["private_key"] = sa_info["private_key"].replace("\\\\n", "\n").replace("\\n", "\n")
+
+    creds = service_account.Credentials.from_service_account_info(sa_info, scopes=SCOPES)
+    service = build("drive", "v3", credentials=creds, cache_discovery=False)
+    return service
+
+
+# ============================
+# Helpers
+# ============================
+
+def format_file_size(size_str: Optional[str]) -> str:
+    if not size_str:
+        return "-"
+    try:
+        size = int(size_str)
+    except Exception:
+        return size_str
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if size < 1024.0:
+            return f"{size:.0f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} PB"
+
+
+def _retry(fn, max_tries: int = 3, base_delay: float = 0.8):
+    last_err = None
+    for attempt in range(1, max_tries + 1):
+        try:
+            return fn()
         except HttpError as e:
-            raise Exception(f"HTTP Error {e.resp.status}: {e.error_details}")
+            last_err = e
+            # exponential backoff
+            time.sleep(base_delay * (2 ** (attempt - 1)))
         except Exception as e:
-            raise Exception(f"Failed to list files in folder: {str(e)}")
+            last_err = e
+            time.sleep(base_delay * (2 ** (attempt - 1)))
+    if last_err:
+        raise last_err
 
-def download_file(service, file_id: str, max_retries: int = 3) -> BytesIO:
-    """Download a file from Google Drive and return as BytesIO object with retry logic."""
-    for attempt in range(max_retries):
+
+# ============================
+# File Listing / Query
+# ============================
+
+def list_files_in_folder(service, folder_id: str) -> List[Dict[str, Any]]:
+    \"\"\"List non-trashed files (id, name, size, mimeType, modifiedTime) within a folder.\"\"\"
+    files: List[Dict[str, Any]] = []
+    page_token = None
+    q = f"'{folder_id}' in parents and trashed = false"
+    fields = "nextPageToken, files(id,name,size,mimeType,modifiedTime)"
+    while True:
+        def _call():
+            return service.files().list(q=q, pageToken=page_token, fields=fields, orderBy="name").execute()
+        resp = _retry(_call)
+        files.extend(resp.get("files", []))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return files
+
+
+def _find_file_by_name(service, folder_id: str, filename: str) -> Optional[str]:
+    safe_name = filename.replace("'", "\\'")
+    q = f"'{folder_id}' in parents and name = '{safe_name}' and trashed = false"
+    fields = "files(id,name)"
+    def _call():
+        return service.files().list(q=q, fields=fields, pageSize=1).execute()
+    resp = _retry(_call)
+    files = resp.get("files", [])
+    return files[0]["id"] if files else None
+
+
+# ============================
+# Download
+# ============================
+
+def download_file(service, file_id: str) -> io.BytesIO:
+    \"\"\"Download a Drive file as BytesIO.\"\"\"
+    request = service.files().get_media(fileId=file_id)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+
+    def _step():
+        return downloader.next_chunk()
+
+    while not done:
+        status, done = _retry(_step)
+        # Optional: could display progress in Streamlit if desired
+
+    fh.seek(0)
+    return fh
+
+
+# ============================
+# Upload (Update-or-Create)
+# ============================
+
+def upload_file(service, folder_id: str, local_path: str, mime_type: str = "application/octet-stream") -> str:
+    \"\"\"Upload a local file to Drive folder. If a file with the same name exists in that folder, update it.
+    Returns the Drive file id.
+    \"\"\"
+    filename = os.path.basename(local_path)
+    file_id = _find_file_by_name(service, folder_id, filename)
+    media = MediaFileUpload(local_path, mimetype=mime_type, resumable=True)
+
+    if file_id:
+        # Try update existing file
         try:
-            # Request file content
-            request = service.files().get_media(fileId=file_id)
-            
-            # Download to BytesIO
-            file_content = BytesIO()
-            downloader = MediaIoBaseDownload(file_content, request)
-            
-            done = False
-            while not done:
-                status, done = downloader.next_chunk()
-            
-            file_content.seek(0)
-            return file_content
-            
-        except (ssl.SSLError, ConnectionError) as e:
-            if attempt < max_retries - 1:
-                st.warning(f"Download connection issue (attempt {attempt + 1}/{max_retries}), retrying...")
-                time.sleep(2 ** attempt)
-                continue
-            else:
-                raise Exception(f"Failed to download after {max_retries} attempts: {str(e)}")
-        except Exception as e:
-            raise Exception(f"Failed to download file {file_id}: {str(e)}")
+            def _call():
+                return service.files().update(fileId=file_id, media_body=media, fields="id").execute()
+            _retry(_call)
+            return file_id
+        except HttpError:
+            # Fall back to create if update is not permitted
+            pass
 
-
-def upload_file_to_drive(service, file_path: str, folder_id: str, file_name: str = None) -> str:
-    """Upload a file to Google Drive folder and return the file ID."""
-    try:
-        from googleapiclient.http import MediaFileUpload
-        
-        if file_name is None:
-            file_name = os.path.basename(file_path)
-        
-        # Check if file already exists in the folder
-        existing_file_id = find_file_by_name(service, folder_id, file_name)
-        
-        file_metadata = {
-            'name': file_name,
-            'parents': [folder_id]
-        }
-        
-        media = MediaFileUpload(file_path, resumable=True)
-        
-        if existing_file_id:
-            # Update existing file
-            file = service.files().update(
-                fileId=existing_file_id,
-                media_body=media
-            ).execute()
-            st.info(f"Updated existing file: {file_name}")
-        else:
-            # Create new file
-            file = service.files().create(
-                body=file_metadata,
-                media_body=media,
-                fields='id, name'
-            ).execute()
-            st.success(f"Uploaded new file: {file_name}")
-        
-        return file['id']
-        
-    except Exception as e:
-        raise Exception(f"Failed to upload file {file_name}: {str(e)}")
-
-
-def find_file_by_name(service, folder_id: str, file_name: str) -> str:
-    """Find a file by name in a specific folder. Returns file ID or None."""
-    try:
-        query = f"name='{file_name}' and '{folder_id}' in parents and trashed=false"
-        
-        results = service.files().list(
-            q=query,
-            fields="files(id, name)",
-            pageSize=1
-        ).execute()
-        
-        files = results.get('files', [])
-        
-        if files:
-            return files[0]['id']
-        return None
-        
-    except Exception as e:
-        st.warning(f"Error searching for file {file_name}: {e}")
-        return None
-
-
-def download_embeddings_from_drive(service, folder_id: str, embeddings_file: str, faiss_file: str) -> Tuple[bool, bool]:
-    """
-    Download embeddings files from Google Drive if they exist.
-    Returns: (embeddings_exists, faiss_exists)
-    """
-    try:
-        # Check for embeddings file
-        embeddings_id = find_file_by_name(service, folder_id, embeddings_file)
-        faiss_id = find_file_by_name(service, folder_id, faiss_file)
-        
-        embeddings_exists = False
-        faiss_exists = False
-        
-        if embeddings_id:
-            st.info(f"📥 Downloading {embeddings_file} from Google Drive...")
-            content = download_file(service, embeddings_id)
-            with open(embeddings_file, 'wb') as f:
-                f.write(content.read())
-            embeddings_exists = True
-            st.success(f"✅ Downloaded {embeddings_file}")
-        
-        if faiss_id:
-            st.info(f"📥 Downloading {faiss_file} from Google Drive...")
-            content = download_file(service, faiss_id)
-            with open(faiss_file, 'wb') as f:
-                f.write(content.read())
-            faiss_exists = True
-            st.success(f"✅ Downloaded {faiss_file}")
-        
-        return embeddings_exists, faiss_exists
-        
-    except Exception as e:
-        st.error(f"Error downloading embeddings from Drive: {e}")
-        return False, False
-
-
-def upload_embeddings_to_drive(service, folder_id: str, embeddings_file: str, faiss_file: str):
-    """Upload embeddings files to Google Drive."""
-    try:
-        st.info("📤 Uploading embeddings to Google Drive...")
-        
-        if os.path.exists(embeddings_file):
-            upload_file_to_drive(service, embeddings_file, folder_id, os.path.basename(embeddings_file))
-        
-        if os.path.exists(faiss_file):
-            upload_file_to_drive(service, faiss_file, folder_id, os.path.basename(faiss_file))
-        
-        st.success("✅ Embeddings saved to Google Drive!")
-        
-    except Exception as e:
-        st.error(f"Error uploading embeddings to Drive: {e}")
-
-def get_file_metadata(service, file_id: str) -> Dict[str, Any]:
-    """Get metadata for a specific file."""
-    try:
-        file = service.files().get(
-            fileId=file_id,
-            fields='id, name, mimeType, size, modifiedTime, createdTime, owners'
-        ).execute()
-        
-        return {
-            'id': file['id'],
-            'name': file['name'],
-            'mimeType': file['mimeType'],
-            'size': file.get('size', 'Unknown'),
-            'modifiedDate': file.get('modifiedTime', 'Unknown'),
-            'createdDate': file.get('createdTime', 'Unknown'),
-            'owners': file.get('owners', [])
-        }
-        
-    except Exception as e:
-        raise Exception(f"Failed to get metadata for file {file_id}: {str(e)}")
-
-def check_folder_access(service, folder_id: str) -> bool:
-    """Check if the service account has access to the specified folder."""
-    try:
-        folder = service.files().get(
-            fileId=folder_id,
-            fields='name, mimeType'
-        ).execute()
-        
-        # Check if it's actually a folder
-        if folder['mimeType'] != 'application/vnd.google-apps.folder':
-            raise Exception(f"ID {folder_id} is not a folder")
-        
-        return True
-        
-    except Exception as e:
-        raise Exception(f"Cannot access folder {folder_id}: {str(e)}")
-
-def validate_service_account_json(service_account_json: str) -> Dict[str, Any]:
-    """Validate and parse service account JSON."""
-    try:
-        if isinstance(service_account_json, str):
-            service_account_dict = json.loads(service_account_json)
-        else:
-            service_account_dict = service_account_json
-        
-        # Check required fields
-        required_fields = ['type', 'project_id', 'private_key_id', 'private_key', 'client_email', 'client_id']
-        for field in required_fields:
-            if field not in service_account_dict:
-                raise ValueError(f"Missing required field: {field}")
-        
-        return service_account_dict
-        
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON format: {str(e)}")
-    except Exception as e:
-        raise ValueError(f"Service account validation failed: {str(e)}")
-
-def get_supported_mime_types() -> List[str]:
-    """Return list of supported MIME types."""
-    return [
-        'application/pdf',
-        'application/vnd.openxmlformats-officedocument.presentationml.presentation'
-    ]
-
-def is_supported_file_type(mime_type: str) -> bool:
-    """Check if file type is supported."""
-    return mime_type in get_supported_mime_types()
-
-def format_file_size(size_bytes: str) -> str:
-    """Format file size in human-readable format."""
-    try:
-        size = int(size_bytes)
-        for unit in ['B', 'KB', 'MB', 'GB']:
-            if size < 1024:
-                return f"{size:.1f} {unit}"
-            size /= 1024
-        return f"{size:.1f} TB"
-    except (ValueError, TypeError):
-        return "Unknown"
+    # Create new file in the folder
+    file_metadata = {"name": filename, "parents": [folder_id]}
+    def _create():
+        return service.files().create(body=file_metadata, media_body=media, fields="id").execute()
+    created = _retry(_create)
+    return created["id"]
+"""
+Path("/mnt/data/drive_utils.py").write_text(drive_utils_code, encoding="utf-8")
+print("Created updated drive_utils.py at /mnt/data")
