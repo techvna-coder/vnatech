@@ -436,6 +436,8 @@ def main():
                 st.code(txt, language="markdown")
                 st.markdown('---')
 
+st.caption("Sản phẩm thử nghiệm của Ban Kỹ thuật – VNA. Mọi ý kiến đóng góp vui lòng liên hệ Phòng Kỹ thuật Máy bay.")
+
 
 if __name__ == "__main__":
     main()
