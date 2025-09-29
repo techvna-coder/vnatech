@@ -1,11 +1,14 @@
 import streamlit as st
-import openai
+from openai import OpenAI
 import PyPDF2
 from pptx import Presentation
 import tiktoken
 from typing import List, Dict, Any
 from io import BytesIO
 import time
+
+# Initialize OpenAI client
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 # Initialize tokenizer for text-embedding-3-small
 tokenizer = tiktoken.encoding_for_model("text-embedding-3-small")
@@ -120,7 +123,7 @@ def get_embeddings(texts: List[str], batch_size: int = 100) -> List[List[float]]
                 st.progress(progress, text=f"Generating embeddings... {i + len(batch)}/{len(texts)}")
             
             # Generate embeddings for the batch
-            response = openai.embeddings.create(
+            response = client.embeddings.create(
                 model="text-embedding-3-small",
                 input=batch
             )
