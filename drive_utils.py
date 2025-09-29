@@ -1,10 +1,13 @@
 import streamlit as st
 import json
+import ssl
+import certifi
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.http import MediaIoBaseDownload, HttpError
 from typing import List, Dict, Any
 from io import BytesIO
+import httplib2
 
 def authenticate_drive():
     """Authenticate with Google Drive using service account credentials."""
@@ -28,8 +31,12 @@ def authenticate_drive():
             scopes=['https://www.googleapis.com/auth/drive.readonly']
         )
         
-        # Build the Drive service
-        service = build('drive', 'v3', credentials=credentials)
+        # Create HTTP client with proper SSL handling
+        http = httplib2.Http(ca_certs=certifi.where())
+        http = credentials.authorize(http)
+        
+        # Build the Drive service with the authorized HTTP client
+        service = build('drive', 'v3', http=http)
         
         return service
         
@@ -65,6 +72,8 @@ def list_files_in_folder(service, folder_id: str) -> List[Dict[str, Any]]:
         
         return formatted_files
         
+    except HttpError as e:
+        raise Exception(f"HTTP Error {e.resp.status}: {e.error_details}")
     except Exception as e:
         raise Exception(f"Failed to list files in folder: {str(e)}")
 
