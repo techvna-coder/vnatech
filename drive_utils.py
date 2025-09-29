@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Google Drive helpers for Streamlit (Service Account).
-Minimal, ASCII-only syntax to avoid SyntaxError on older runtimes.
+Includes upload/download for RAG cache files.
+ASCII-safe, Python 3.8+ compatible.
 """
 import io
 import os
@@ -37,12 +38,12 @@ def authenticate_drive():
     else:
         raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON must be a JSON string or dict.")
 
-    # Normalize private_key newlines ("\\n" or "\n" -> newline)
+    # Normalize private_key newlines
     if "private_key" in sa_info and isinstance(sa_info["private_key"], str):
         pk = sa_info["private_key"]
-        pk = pk.replace("\\n", "\n")  # collapse escaped backslashes first
-        pk = pk.replace("\n", "\n")    # ensure raw \n stays as two chars in memory
-        pk = pk.encode('utf-8').decode('unicode_escape')
+        # keep as raw with literal \n then decode escapes to real newlines
+        pk = pk.replace("\\n", "\n")
+        pk = pk.encode("utf-8").decode("unicode_escape")
         sa_info["private_key"] = pk
 
     creds = service_account.Credentials.from_service_account_info(sa_info, scopes=SCOPES)
@@ -71,12 +72,13 @@ def format_file_size(size_str):
         return str(size_str)
     units = ["B", "KB", "MB", "GB", "TB"]
     i = 0
-    while size >= 1024 and i < len(units) - 1:
-        size = size / 1024.0
+    val = float(size)
+    while val >= 1024.0 and i < len(units) - 1:
+        val = val / 1024.0
         i += 1
     if i == 0:
-        return "%d %s" % (size, units[i])
-    return "%.1f %s" % (size, units[i])
+        return "%d %s" % (val, units[i])
+    return "%.1f %s" % (val, units[i])
 
 
 def list_files_in_folder(service, folder_id):
@@ -140,3 +142,39 @@ def upload_file(service, folder_id, local_path, mime_type="application/octet-str
         return service.files().create(body=file_metadata, media_body=media, fields="id").execute()
     created = _retry(_create)
     return created["id"]
+
+
+# ====== Convenience helpers for RAG caches ======
+
+def download_embeddings_from_drive(service, folder_id, embeddings_name="embeddings_meta.pkl", faiss_name="faiss_index.bin"):
+    """Try to download cache files from Drive into current working dir.
+    Returns a dict with local paths if found.
+    """
+    out = {"embeddings_path": None, "faiss_path": None}
+
+    emb_id = _find_file_by_name(service, folder_id, embeddings_name)
+    if emb_id:
+        buf = download_file(service, emb_id)
+        with open(embeddings_name, "wb") as f:
+            f.write(buf.getvalue())
+        out["embeddings_path"] = os.path.abspath(embeddings_name)
+
+    faiss_id = _find_file_by_name(service, folder_id, faiss_name)
+    if faiss_id:
+        buf = download_file(service, faiss_id)
+        with open(faiss_name, "wb") as f:
+            f.write(buf.getvalue())
+        out["faiss_path"] = os.path.abspath(faiss_name)
+
+    return out
+
+
+def upload_embeddings_to_drive(service, folder_id, embeddings_path="embeddings_meta.pkl", faiss_path="faiss_index.bin"):
+    """Upload (or update) cache files to Drive folder. Returns dict of file ids."
+    """
+    out = {"embeddings_id": None, "faiss_id": None}
+    if os.path.exists(embeddings_path):
+        out["embeddings_id"] = upload_file(service, folder_id, embeddings_path, mime_type="application/octet-stream")
+    if os.path.exists(faiss_path):
+        out["faiss_id"] = upload_file(service, folder_id, faiss_path, mime_type="application/octet-stream")
+    return out
