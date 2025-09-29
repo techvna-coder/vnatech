@@ -8,11 +8,14 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 
-# Third-party deps expected:
-#   openai>=1.12.0
-#   faiss-cpu>=1.7.4
-#   streamlit-authenticator>=0.3.3
+# Deps expected:
 #   bcrypt>=4.0.1
+#   faiss-cpu>=1.7.4
+#   openai>=1.12.0
+#   google-api-python-client>=2.129.0
+#   google-auth>=2.29.0
+#   google-auth-httplib2>=0.2.0
+#   streamlit>=1.31.0
 
 # FAISS
 try:
@@ -28,11 +31,11 @@ except Exception:
     st.error("OpenAI SDK is required. Please add 'openai>=1.12.0' to requirements.txt")
     st.stop()
 
-# Authentication
+# Bcrypt (custom auth)
 try:
-    import streamlit_authenticator as stauth
+    import bcrypt
 except Exception:
-    st.error("Please add 'streamlit-authenticator' and 'bcrypt' to requirements.txt")
+    st.error("Please add 'bcrypt>=4.0.1' to requirements.txt")
     st.stop()
 
 # Local modules (Drive + processors)
@@ -69,71 +72,76 @@ except Exception as e:
 EMBEDDINGS_FILE = "embeddings_meta.pkl"
 FAISS_INDEX_FILE = "faiss_index.bin"
 TOP_K = 10
-EMBED_MODEL = "text-embedding-3-small"
-CHAT_MODEL = "gpt-4o-mini"
 
 st.set_page_config(page_title="VNA Tech RAG", layout="wide")
 
 
 # =========================
-# Authentication Gate
+# Custom Authentication (bcrypt + secrets)
 # =========================
-def auth_gate() -> Tuple[bool, str]:
+def _load_credentials_from_secrets() -> Dict[str, Dict[str, str]]:
+    """Read users from secrets [auth.users.*] and return {username: {name, password_hash}}"""
     if "auth" not in st.secrets:
-        st.error("Authentication is not configured. Please add an [auth] section in secrets.")
-        st.stop()
-
-    auth_cfg = st.secrets["auth"]
-    cookie_name = auth_cfg.get("cookie_name", "vnatech_auth")
-    cookie_key = auth_cfg.get("cookie_key", "change_me")
-    cookie_expiry_days = int(auth_cfg.get("cookie_expiry_days", 30))
-
-    users = auth_cfg.get("users", {})
-    if not users:
-        st.error("No users configured under [auth.users].")
-        st.stop()
-
-    # Build credentials for v0.3+ (usernames -> {name, password})
-    credentials = {"usernames": {}}
+        raise RuntimeError("Missing [auth] in secrets.")
+    users = st.secrets["auth"].get("users", {})
+    creds = {}
     for _, u in users.items():
         uname = u.get("username")
-        if not uname:
-            continue
-        credentials["usernames"][uname] = {
-            "name": u.get("name", uname),
-            "password": u.get("password", ""),  # bcrypt hash
-        }
-    if not credentials["usernames"]:
-        st.error("No valid users in [auth.users]. Each user needs 'username' and bcrypt 'password'.")
+        pwd = u.get("password")
+        name = u.get("name", uname)
+        if uname and pwd:
+            creds[uname] = {"name": name, "password": pwd}
+    if not creds:
+        raise RuntimeError("No valid users under [auth.users].")
+    return creds
+
+def _verify_password(plain: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
+
+def login_gate() -> Tuple[bool, str, str]:
+    """Render a simple login form and verify against bcrypt hashes in secrets.
+    Returns (ok, username, name).
+    """
+    try:
+        creds = _load_credentials_from_secrets()
+    except Exception as e:
+        st.error(str(e))
         st.stop()
 
-    # Instantiate
-    authenticator = stauth.Authenticate(
-        credentials,
-        cookie_name,
-        cookie_key,
-        cookie_expiry_days,
-    )
+    if "auth_user" in st.session_state and st.session_state.get("auth_ok"):
+        u = st.session_state["auth_user"]
+        display_name = st.session_state.get("auth_name", u)
+        return True, u, display_name
 
-    # GỌI login với key cố định để tránh trùng form
-    try:
-        # API mới (0.3.x–0.4.x): location là tham số vị trí đầu tiên
-        name, auth_status, username = authenticator.login('main', max_login_attempts=3, key='auth_login')
-    except TypeError:
-        # fallback một số build yêu cầu keyword location
-        name, auth_status, username = authenticator.login(location='main', max_login_attempts=3, key='auth_login')
+    with st.form("login_form", clear_on_submit=False):
+        st.subheader("Đăng nhập để truy cập VNA Tech RAG")
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Login")
 
-    if auth_status:
-        with st.sidebar:
-            st.success(f"Signed in as **{name}**")
-            authenticator.logout("Sign out", "sidebar")
-        return True, username
-    elif auth_status is False:
-        st.error("Invalid username or password.")
-        return False, ""
-    else:
-        st.info("Please sign in to continue.")
-        return False, ""
+    if submitted:
+        if username in creds and _verify_password(password, creds[username]["password"]):
+            st.session_state["auth_ok"] = True
+            st.session_state["auth_user"] = username
+            st.session_state["auth_name"] = creds[username]["name"]
+            st.success("Đăng nhập thành công.")
+            st.experimental_rerun()
+        else:
+            st.error("Sai username hoặc password.")
+
+    return False, "", ""
+
+def logout_button():
+    if st.session_state.get("auth_ok"):
+        if st.sidebar.button("Sign out"):
+            for k in ["auth_ok", "auth_user", "auth_name"]:
+                if k in st.session_state:
+                    del st.session_state[k]
+            st.success("Đã đăng xuất.")
+            st.experimental_rerun()
 
 
 # =========================
@@ -143,7 +151,6 @@ def auth_gate() -> Tuple[bool, str]:
 def _drive_service():
     return authenticate_drive()
 
-
 def _list_drive_files() -> List[Dict[str, Any]]:
     folder_id = st.secrets.get("DRIVE_FOLDER_ID")
     if not folder_id:
@@ -151,7 +158,6 @@ def _list_drive_files() -> List[Dict[str, Any]]:
         st.stop()
     service = _drive_service()
     files = list_files_in_folder(service, folder_id)
-    # Keep only PDFs and PPTX
     filtered = []
     for f in files:
         name = f.get("name", "")
@@ -174,14 +180,10 @@ def _try_load_local_index():
             return None, None
     return None, None
 
-
 def _load_or_pull_cache_from_drive() -> Tuple[Any, List[Dict[str, Any]]]:
-    # First try local
     idx, meta = _try_load_local_index()
     if idx is not None and meta is not None:
         return idx, meta
-
-    # If not local, pull from Drive (if exists)
     service = _drive_service()
     folder_id = st.secrets.get("DRIVE_FOLDER_ID")
     paths = download_embeddings_from_drive(service, folder_id, EMBEDDINGS_FILE, FAISS_INDEX_FILE)
@@ -193,18 +195,14 @@ def _load_or_pull_cache_from_drive() -> Tuple[Any, List[Dict[str, Any]]]:
             return idx, meta
         except Exception:
             pass
-
     return None, None
 
-
 def _build_or_load_index(process_all: bool = False) -> Tuple[Any, List[Dict[str, Any]]]:
-    # If not forcing rebuild, try load local or from Drive
     if not process_all:
         idx, meta = _load_or_pull_cache_from_drive()
         if idx is not None and meta is not None:
             return idx, meta
 
-    # Build index from scratch
     service = _drive_service()
     drive_folder = st.secrets.get("DRIVE_FOLDER_ID")
     files = _list_drive_files()
@@ -219,10 +217,8 @@ def _build_or_load_index(process_all: bool = False) -> Tuple[Any, List[Dict[str,
         file_name = f["name"]
         progress.progress(i / n, text="Downloading %s" % file_name)
 
-        # Download
         content: BytesIO = download_file(service, file_id)
 
-        # Parse
         try:
             if file_name.lower().endswith(".pdf"):
                 text, meta = process_pdf(content)
@@ -234,10 +230,7 @@ def _build_or_load_index(process_all: bool = False) -> Tuple[Any, List[Dict[str,
             st.warning("Failed to parse '%s': %s" % (file_name, e))
             continue
 
-        # Chunk
         chunks = chunk_text_smart(text, meta, chunk_size=1000, chunk_overlap=200)
-
-        # Embeddings
         texts = [c["text"] for c in chunks]
         try:
             vecs = get_embeddings(texts, batch_size=100)
@@ -245,7 +238,6 @@ def _build_or_load_index(process_all: bool = False) -> Tuple[Any, List[Dict[str,
             st.error("Embedding failed for %s: %s" % (file_name, e))
             continue
 
-        # Collect
         for j, c in enumerate(chunks):
             all_vectors.append(vecs[j])
             row = {"file_id": file_id, "file_name": file_name}
@@ -256,18 +248,15 @@ def _build_or_load_index(process_all: bool = False) -> Tuple[Any, List[Dict[str,
         st.error("No embeddings were created. Please check your Drive folder and parsers.")
         st.stop()
 
-    # Build FAISS index (cosine via inner product on L2-normalized vectors)
     mat = np.array(all_vectors, dtype="float32")
     faiss.normalize_L2(mat)
     index = faiss.IndexFlatIP(mat.shape[1])
     index.add(mat)
 
-    # Save caches locally
     with open(EMBEDDINGS_FILE, "wb") as f:
         pickle.dump(all_meta, f)
     faiss.write_index(index, FAISS_INDEX_FILE)
 
-    # Upload caches to Drive (persist across restarts)
     try:
         upload_embeddings_to_drive(service, drive_folder, EMBEDDINGS_FILE, FAISS_INDEX_FILE)
     except Exception as e:
@@ -280,11 +269,10 @@ def _build_or_load_index(process_all: bool = False) -> Tuple[Any, List[Dict[str,
 # Retrieval & Answering
 # =========================
 def _embed_query(client: OpenAI, query: str) -> np.ndarray:
-    resp = client.embeddings.create(model=EMBEDDINGS_FILE and "text-embedding-3-small", input=[query])
+    resp = client.embeddings.create(model="text-embedding-3-small", input=[query])
     v = np.array(resp.data[0].embedding, dtype="float32")
     v = v / np.linalg.norm(v)
     return v
-
 
 def _search(index, meta: List[Dict[str, Any]], qvec: np.ndarray, topk: int = TOP_K):
     D, I = index.search(qvec.reshape(1, -1), topk)
@@ -296,7 +284,6 @@ def _search(index, meta: List[Dict[str, Any]], qvec: np.ndarray, topk: int = TOP
         item["similarity"] = float(score)
         results.append(item)
     return results
-
 
 def _format_context(chunks: List[Dict[str, Any]]) -> str:
     blocks = []
@@ -311,7 +298,6 @@ def _format_context(chunks: List[Dict[str, Any]]) -> str:
         text = c["text"]
         blocks.append(header + "\n" + text)
     return "\n\n---\n\n".join(blocks)
-
 
 def _ask_llm(client: OpenAI, question: str, chunks: List[Dict[str, Any]]) -> str:
     context = _format_context(chunks)
@@ -372,23 +358,23 @@ def sidebar_panel(index, meta):
         for f in files[:100]:
             st.sidebar.caption("• %s (%s)" % (f["name"], format_file_size(f.get("size", ""))))
 
+    logout_button()
+
 
 def main():
-    ok, username = auth_gate()
+    ok, username, display_name = login_gate()
     if not ok:
         st.stop()
 
     st.title("VNA Tech Streamlit RAG App")
     st.caption("Truy vấn trực tiếp các tài liệu PDF/PPTX trong Google Drive.")
 
-    # OpenAI client
     api_key = st.secrets.get("OPENAI_API_KEY")
     if not api_key:
         st.error("OPENAI_API_KEY is missing in secrets.")
         st.stop()
     client = OpenAI(api_key=api_key)
 
-    # Load or build index
     force = st.session_state.get("force_rebuild", False)
     index, meta = _build_or_load_index(process_all=force)
     st.session_state["force_rebuild"] = False
