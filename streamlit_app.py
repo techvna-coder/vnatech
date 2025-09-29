@@ -8,11 +8,17 @@ from typing import List, Dict, Any
 import tiktoken
 from io import BytesIO
 
-# Try importing OpenAI
+# Try importing required modules
 try:
     from openai import OpenAI
 except ImportError:
     st.error("OpenAI library not installed. Please add 'openai>=1.12.0' to requirements.txt")
+    st.stop()
+
+try:
+    import faiss
+except ImportError:
+    st.error("FAISS library not installed. Please add 'faiss-cpu>=1.7.4' to requirements.txt")
     st.stop()
 
 # Import our custom modules
@@ -37,56 +43,180 @@ DRIVE_FOLDER_ID = st.secrets["DRIVE_FOLDER_ID"]
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
 TOP_K = 10
+EMBEDDINGS_FILE = "embeddings_meta.pkl"
+FAISS_INDEX_FILE = "faiss_index.bin"
 
 @st.cache_data
-def load_cached_embeddings(file_id: str) -> Dict[str, Any]:
-    """Load cached embeddings if they exist."""
-    cache_file = f"{file_id}.pkl"
-    if os.path.exists(cache_file):
+def load_cached_data():
+    """Load cached embeddings metadata and FAISS index if they exist."""
+    if os.path.exists(EMBEDDINGS_FILE) and os.path.exists(FAISS_INDEX_FILE):
         try:
-            with open(cache_file, 'rb') as f:
-                return pickle.load(f)
+            with open(EMBEDDINGS_FILE, 'rb') as f:
+                metadata = pickle.load(f)
+            
+            index = faiss.read_index(FAISS_INDEX_FILE)
+            
+            return metadata, index
         except Exception as e:
-            st.warning(f"Failed to load cache for {file_id}: {e}")
-    return None
+            st.warning(f"Failed to load cached data: {e}")
+    return None, None
 
-def save_embeddings_cache(file_id: str, data: Dict[str, Any]):
-    """Save embeddings to cache."""
-    cache_file = f"{file_id}.pkl"
+def save_embeddings_data(metadata: Dict[str, Any], index):
+    """Save embeddings metadata and FAISS index to disk."""
     try:
-        with open(cache_file, 'wb') as f:
-            pickle.dump(data, f)
+        with open(EMBEDDINGS_FILE, 'wb') as f:
+            pickle.dump(metadata, f)
+        
+        faiss.write_index(index, FAISS_INDEX_FILE)
+        
+        st.success(f"✅ Saved embeddings to {EMBEDDINGS_FILE} and {FAISS_INDEX_FILE}")
     except Exception as e:
-        st.error(f"Failed to save cache for {file_id}: {e}")
+        st.error(f"Failed to save embeddings: {e}")
 
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    """Calculate cosine similarity between two vectors."""
-    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+def process_all_documents(drive_service, folder_id: str):
+    """Process all documents in the Google Drive folder."""
+    try:
+        # Get all files
+        files = list_files_in_folder(drive_service, folder_id)
+        
+        if not files:
+            st.warning("No files found in the folder.")
+            return None, None
+        
+        st.info(f"Found {len(files)} documents to process...")
+        
+        all_chunks = []
+        all_metadata = []
+        
+        progress_bar = st.progress(0)
+        
+        for idx, file in enumerate(files):
+            file_id = file['id']
+            file_name = file['name']
+            
+            st.write(f"📄 Processing: {file_name}")
+            
+            try:
+                # Download file
+                file_content = download_file(drive_service, file_id)
+                
+                # Extract text based on file type
+                if file['mimeType'] == 'application/pdf':
+                    text = process_pdf(file_content)
+                elif file['mimeType'] == 'application/vnd.openxmlformats-officedocument.presentationml.presentation':
+                    text = process_pptx(file_content)
+                else:
+                    st.warning(f"Skipping unsupported file type: {file_name}")
+                    continue
+                
+                if not text.strip():
+                    st.warning(f"No text extracted from {file_name}")
+                    continue
+                
+                # Chunk the text
+                chunks = chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP)
+                
+                # Store chunks with metadata
+                for chunk_idx, chunk in enumerate(chunks):
+                    all_chunks.append(chunk)
+                    all_metadata.append({
+                        'file_id': file_id,
+                        'file_name': file_name,
+                        'chunk_idx': chunk_idx,
+                        'total_chunks': len(chunks)
+                    })
+                
+                st.success(f"✅ {file_name}: {len(chunks)} chunks")
+                
+            except Exception as e:
+                st.error(f"Failed to process {file_name}: {e}")
+                continue
+            
+            progress_bar.progress((idx + 1) / len(files))
+        
+        if not all_chunks:
+            st.error("No chunks were extracted from any document.")
+            return None, None
+        
+        st.info(f"Total chunks across all documents: {len(all_chunks)}")
+        
+        # Generate embeddings for all chunks
+        st.write("🔄 Generating embeddings...")
+        embeddings = get_embeddings(all_chunks)
+        embeddings_array = np.array(embeddings, dtype='float32')
+        
+        # Create FAISS index
+        st.write("🔍 Creating FAISS index...")
+        dimension = embeddings_array.shape[1]
+        index = faiss.IndexFlatIP(dimension)  # Inner product for cosine similarity
+        
+        # Normalize vectors for cosine similarity
+        faiss.normalize_L2(embeddings_array)
+        index.add(embeddings_array)
+        
+        # Prepare metadata
+        metadata = {
+            'chunks': all_chunks,
+            'metadata': all_metadata,
+            'chunk_size': CHUNK_SIZE,
+            'chunk_overlap': CHUNK_OVERLAP,
+            'total_files': len(files),
+            'total_chunks': len(all_chunks)
+        }
+        
+        # Save to disk
+        save_embeddings_data(metadata, index)
+        
+        return metadata, index
+        
+    except Exception as e:
+        st.error(f"Error processing documents: {e}")
+        return None, None
 
-def retrieve_relevant_chunks(query: str, embeddings_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Retrieve the most relevant chunks for a query."""
-    # Get query embedding
-    query_embedding = get_embeddings([query])[0]
-    
-    # Calculate similarities
-    similarities = []
-    for i, chunk_embedding in enumerate(embeddings_data['embeddings']):
-        similarity = cosine_similarity(query_embedding, np.array(chunk_embedding))
-        similarities.append({
-            'chunk_idx': i,
-            'similarity': similarity,
-            'text': embeddings_data['chunks'][i]
-        })
-    
-    # Sort by similarity and return top K
-    similarities.sort(key=lambda x: x['similarity'], reverse=True)
-    return similarities[:TOP_K]
+def search_documents(query: str, metadata: Dict[str, Any], index) -> List[Dict[str, Any]]:
+    """Search for relevant chunks using FAISS."""
+    try:
+        # Get query embedding
+        query_embedding = get_embeddings([query])[0]
+        query_vector = np.array([query_embedding], dtype='float32')
+        
+        # Normalize for cosine similarity
+        faiss.normalize_L2(query_vector)
+        
+        # Search in FAISS index
+        distances, indices = index.search(query_vector, TOP_K)
+        
+        # Prepare results
+        results = []
+        for i, idx in enumerate(indices[0]):
+            if idx < len(metadata['chunks']):
+                results.append({
+                    'chunk_idx': int(idx),
+                    'text': metadata['chunks'][idx],
+                    'similarity': float(distances[0][i]),
+                    'file_name': metadata['metadata'][idx]['file_name'],
+                    'file_id': metadata['metadata'][idx]['file_id'],
+                    'chunk_number': metadata['metadata'][idx]['chunk_idx'] + 1,
+                    'total_chunks': metadata['metadata'][idx]['total_chunks']
+                })
+        
+        return results
+        
+    except Exception as e:
+        st.error(f"Search failed: {e}")
+        return []
 
 def generate_answer(query: str, relevant_chunks: List[Dict[str, Any]]) -> str:
     """Generate answer using OpenAI with retrieved chunks as context."""
-    context = "\n\n".join([chunk['text'] for chunk in relevant_chunks])
+    context_parts = []
+    for chunk in relevant_chunks:
+        context_parts.append(f"[Source: {chunk['file_name']}, Chunk {chunk['chunk_number']}/{chunk['total_chunks']}]\n{chunk['text']}")
     
-    prompt = f"""Based on the following context, please answer the question. If the answer cannot be found in the context, please say so.
+    context = "\n\n---\n\n".join(context_parts)
+    
+    prompt = f"""Based on the following context from multiple documents, please answer the question. 
+If the answer cannot be found in the context, please say so. 
+When answering, mention which document(s) the information comes from.
 
 Context:
 {context}
@@ -99,10 +229,10 @@ Answer:"""
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are a helpful assistant that answers questions based on provided context. Be precise and cite relevant information from the context when possible."},
+                {"role": "system", "content": "You are a helpful assistant that answers questions based on provided context from multiple documents. Always cite the source document when providing information."},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=500,
+            max_tokens=800,
             temperature=0.1
         )
         return response.choices[0].message.content
@@ -117,19 +247,19 @@ def main():
     )
     
     st.title("🤖 VNA Tech RAG App")
-    st.markdown("Query documents from Google Drive using AI-powered search and retrieval.")
+    st.markdown("Query documents from Google Drive using AI-powered multi-document search.")
     
     # Initialize session state
     if 'drive_service' not in st.session_state:
         st.session_state.drive_service = None
-    if 'selected_file' not in st.session_state:
-        st.session_state.selected_file = None
-    if 'embeddings_data' not in st.session_state:
-        st.session_state.embeddings_data = None
+    if 'metadata' not in st.session_state:
+        st.session_state.metadata = None
+    if 'faiss_index' not in st.session_state:
+        st.session_state.faiss_index = None
     
-    # Sidebar for file selection
+    # Sidebar for document management
     with st.sidebar:
-        st.header("📁 Document Selection")
+        st.header("📁 Document Management")
         
         # Authenticate with Google Drive
         if st.session_state.drive_service is None:
@@ -138,142 +268,106 @@ def main():
                     st.session_state.drive_service = authenticate_drive()
                     st.success("✅ Connected to Google Drive")
                 except Exception as e:
-                    st.error(f"❌ Failed to connect to Google Drive: {e}")
+                    st.error(f"❌ Failed to connect: {e}")
                     return
         
-        # List files in folder
-        try:
-            files = list_files_in_folder(st.session_state.drive_service, DRIVE_FOLDER_ID)
-            if not files:
-                st.warning("No files found in the specified folder.")
-                return
-            
-            file_options = {f"{file['name']} ({file['mimeType'].split('.')[-1]})": file for file in files}
-            selected_file_name = st.selectbox(
-                "Select a document:",
-                options=list(file_options.keys()),
-                key="file_selector"
-            )
-            
-            if selected_file_name:
-                st.session_state.selected_file = file_options[selected_file_name]
-                
-        except Exception as e:
-            st.error(f"Error listing files: {e}")
-            return
-    
-    # Main panel
-    if st.session_state.selected_file:
-        file = st.session_state.selected_file
-        st.subheader(f"📄 Selected Document: {file['name']}")
+        # Try to load cached data
+        if st.session_state.metadata is None or st.session_state.faiss_index is None:
+            cached_metadata, cached_index = load_cached_data()
+            if cached_metadata and cached_index:
+                st.session_state.metadata = cached_metadata
+                st.session_state.faiss_index = cached_index
+                st.success(f"✅ Loaded {cached_metadata['total_files']} documents ({cached_metadata['total_chunks']} chunks)")
         
-        # Process document and load/create embeddings
-        col1, col2 = st.columns([3, 1])
-        
-        with col2:
-            if st.button("🔄 Process Document", type="primary"):
-                process_document(file)
-        
-        with col1:
-            st.markdown(f"**File ID:** `{file['id']}`")
-            st.markdown(f"**Type:** {file['mimeType']}")
-        
-        # Check if embeddings are loaded
-        if st.session_state.embeddings_data is None:
-            # Try to load from cache
-            cached_data = load_cached_embeddings(file['id'])
-            if cached_data:
-                st.session_state.embeddings_data = cached_data
-                st.success(f"✅ Loaded cached embeddings ({len(cached_data['chunks'])} chunks)")
-            else:
-                st.info("👆 Click 'Process Document' to extract and embed text content.")
-                return
-        
-        # Query interface
         st.markdown("---")
-        st.subheader("❓ Ask a Question")
         
-        query = st.text_input(
-            "Enter your question:",
-            placeholder="What is this document about?",
-            key="query_input"
-        )
+        # Process all documents button
+        if st.button("🔄 Process All Documents", type="primary", use_container_width=True):
+            with st.spinner("Processing all documents..."):
+                metadata, index = process_all_documents(st.session_state.drive_service, DRIVE_FOLDER_ID)
+                if metadata and index:
+                    st.session_state.metadata = metadata
+                    st.session_state.faiss_index = index
+                    st.rerun()
         
-        col1, col2, col3 = st.columns([1, 1, 2])
-        with col1:
-            search_button = st.button("🔍 Search", type="primary")
-        
-        if search_button and query:
-            with st.spinner("Searching for relevant information..."):
-                # Retrieve relevant chunks
-                relevant_chunks = retrieve_relevant_chunks(query, st.session_state.embeddings_data)
+        if st.session_state.metadata:
+            st.markdown("---")
+            st.subheader("📊 Index Statistics")
+            st.metric("Total Documents", st.session_state.metadata['total_files'])
+            st.metric("Total Chunks", st.session_state.metadata['total_chunks'])
+            
+            # Show document list
+            with st.expander("📄 Indexed Documents"):
+                docs = {}
+                for meta in st.session_state.metadata['metadata']:
+                    if meta['file_name'] not in docs:
+                        docs[meta['file_name']] = 0
+                    docs[meta['file_name']] += 1
                 
-                # Generate answer
-                answer = generate_answer(query, relevant_chunks)
-                
-                # Display results
-                st.markdown("---")
-                st.subheader("🎯 Answer")
-                st.markdown(answer)
-                
-                # Show relevant chunks
-                with st.expander("📋 Retrieved Context Chunks", expanded=False):
-                    for i, chunk in enumerate(relevant_chunks[:5]):  # Show top 5
-                        st.markdown(f"**Chunk {i+1}** (Similarity: {chunk['similarity']:.3f})")
-                        st.markdown(f"```\n{chunk['text'][:500]}{'...' if len(chunk['text']) > 500 else ''}\n```")
-                        st.markdown("---")
-    else:
-        st.info("👈 Please select a document from the sidebar to get started.")
-
-def process_document(file: Dict[str, Any]):
-    """Process the selected document and create embeddings."""
-    file_id = file['id']
-    file_name = file['name']
+                for doc_name, chunk_count in sorted(docs.items()):
+                    st.text(f"• {doc_name} ({chunk_count} chunks)")
     
-    with st.spinner(f"Processing {file_name}..."):
-        try:
-            # Download file
-            file_content = download_file(st.session_state.drive_service, file_id)
+    # Main panel - Query interface
+    if st.session_state.metadata is None or st.session_state.faiss_index is None:
+        st.info("👈 Click 'Process All Documents' in the sidebar to get started.")
+        st.markdown("""
+        ### How it works:
+        1. **Connect to Google Drive** - Automatically done
+        2. **Process All Documents** - Extract and embed all PDFs and PPTX files
+        3. **Ask Questions** - Search across all documents simultaneously
+        4. **Cached Results** - Embeddings are saved locally, no need to reprocess
+        """)
+        return
+    
+    st.markdown("---")
+    st.subheader("❓ Ask Your Question")
+    
+    query = st.text_input(
+        "Enter your question:",
+        placeholder="What information do you need from the documents?",
+        key="query_input"
+    )
+    
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        search_button = st.button("🔍 Search", type="primary", use_container_width=True)
+    
+    if search_button and query:
+        with st.spinner("Searching across all documents..."):
+            # Search for relevant chunks
+            relevant_chunks = search_documents(query, st.session_state.metadata, st.session_state.faiss_index)
             
-            # Extract text based on file type
-            if file['mimeType'] == 'application/pdf':
-                text = process_pdf(file_content)
-            elif file['mimeType'] == 'application/vnd.openxmlformats-officedocument.presentationml.presentation':
-                text = process_pptx(file_content)
-            else:
-                st.error(f"Unsupported file type: {file['mimeType']}")
+            if not relevant_chunks:
+                st.warning("No relevant information found.")
                 return
             
-            if not text.strip():
-                st.error("No text could be extracted from the document.")
-                return
+            # Generate answer
+            answer = generate_answer(query, relevant_chunks)
             
-            # Chunk the text
-            chunks = chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP)
-            st.info(f"Created {len(chunks)} text chunks")
+            # Display results
+            st.markdown("---")
+            st.subheader("🎯 Answer")
+            st.markdown(answer)
             
-            # Generate embeddings
-            with st.spinner("Generating embeddings..."):
-                embeddings = get_embeddings(chunks)
+            # Show source documents
+            st.markdown("---")
+            st.subheader("📚 Sources")
             
-            # Prepare data for caching
-            embeddings_data = {
-                'file_id': file_id,
-                'file_name': file_name,
-                'chunks': chunks,
-                'embeddings': embeddings,
-                'chunk_size': CHUNK_SIZE,
-                'chunk_overlap': CHUNK_OVERLAP
-            }
+            # Group by document
+            docs_referenced = {}
+            for chunk in relevant_chunks:
+                doc_name = chunk['file_name']
+                if doc_name not in docs_referenced:
+                    docs_referenced[doc_name] = []
+                docs_referenced[doc_name].append(chunk)
             
-            # Save to cache and session state
-            save_embeddings_cache(file_id, embeddings_data)
-            st.session_state.embeddings_data = embeddings_data
-            
-            st.success(f"✅ Successfully processed {file_name} ({len(chunks)} chunks, {len(embeddings)} embeddings)")
-            
-        except Exception as e:
-            st.error(f"Error processing document: {e}")
+            for doc_name, chunks in docs_referenced.items():
+                with st.expander(f"📄 {doc_name} ({len(chunks)} relevant chunks)"):
+                    for i, chunk in enumerate(chunks[:3], 1):  # Show top 3 per document
+                        st.markdown(f"**Chunk {chunk['chunk_number']}/{chunk['total_chunks']}** (Similarity: {chunk['similarity']:.3f})")
+                        st.markdown(f"```\n{chunk['text'][:400]}{'...' if len(chunk['text']) > 400 else ''}\n```")
+                        if i < len(chunks):
+                            st.markdown("---")
 
 if __name__ == "__main__":
     main()
