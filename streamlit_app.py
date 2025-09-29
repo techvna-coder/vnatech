@@ -4,6 +4,7 @@ import pandas as pd
 import pickle
 import os
 import json
+import time
 from typing import List, Dict, Any
 import tiktoken
 from io import BytesIO
@@ -23,8 +24,14 @@ except ImportError:
 
 # Import our custom modules
 try:
-    from drive_utils import authenticate_drive, list_files_in_folder, download_file
-    from document_processors import process_pdf, process_pptx, chunk_text, get_embeddings
+    from drive_utils import (
+        authenticate_drive, 
+        list_files_in_folder, 
+        download_file,
+        download_embeddings_from_drive,
+        upload_embeddings_to_drive
+    )
+    from document_processors import process_pdf, process_pptx, chunk_text_smart, get_embeddings
 except ImportError as e:
     st.error(f"Failed to import custom modules: {e}")
     st.info("Make sure drive_utils.py and document_processors.py are in the same directory as this app.")
@@ -47,8 +54,17 @@ EMBEDDINGS_FILE = "embeddings_meta.pkl"
 FAISS_INDEX_FILE = "faiss_index.bin"
 
 @st.cache_data
-def load_cached_data():
-    """Load cached embeddings metadata and FAISS index if they exist."""
+def load_cached_data(_drive_service, folder_id):
+    """Load cached embeddings metadata and FAISS index from local or Google Drive."""
+    # First try to download from Google Drive
+    embeddings_exist, faiss_exist = download_embeddings_from_drive(
+        _drive_service, 
+        folder_id, 
+        EMBEDDINGS_FILE, 
+        FAISS_INDEX_FILE
+    )
+    
+    # Then try to load from local files
     if os.path.exists(EMBEDDINGS_FILE) and os.path.exists(FAISS_INDEX_FILE):
         try:
             with open(EMBEDDINGS_FILE, 'rb') as f:
@@ -56,25 +72,32 @@ def load_cached_data():
             
             index = faiss.read_index(FAISS_INDEX_FILE)
             
+            st.success("✅ Loaded embeddings from cache")
             return metadata, index
         except Exception as e:
             st.warning(f"Failed to load cached data: {e}")
+    
     return None, None
 
-def save_embeddings_data(metadata: Dict[str, Any], index):
-    """Save embeddings metadata and FAISS index to disk."""
+def save_embeddings_data(metadata: Dict[str, Any], index, drive_service, folder_id: str):
+    """Save embeddings metadata and FAISS index to local disk and Google Drive."""
     try:
+        # Save locally first
         with open(EMBEDDINGS_FILE, 'wb') as f:
             pickle.dump(metadata, f)
         
         faiss.write_index(index, FAISS_INDEX_FILE)
         
-        st.success(f"✅ Saved embeddings to {EMBEDDINGS_FILE} and {FAISS_INDEX_FILE}")
+        st.success(f"✅ Saved embeddings locally: {EMBEDDINGS_FILE} and {FAISS_INDEX_FILE}")
+        
+        # Upload to Google Drive
+        upload_embeddings_to_drive(drive_service, folder_id, EMBEDDINGS_FILE, FAISS_INDEX_FILE)
+        
     except Exception as e:
         st.error(f"Failed to save embeddings: {e}")
 
 def process_all_documents(drive_service, folder_id: str):
-    """Process all documents in the Google Drive folder."""
+    """Process all documents in the Google Drive folder with enhanced extraction."""
     try:
         # Get all files
         files = list_files_in_folder(drive_service, folder_id)
@@ -86,7 +109,8 @@ def process_all_documents(drive_service, folder_id: str):
         st.info(f"Found {len(files)} documents to process...")
         
         all_chunks = []
-        all_metadata = []
+        all_chunk_metadata = []
+        document_metadata = []
         
         progress_bar = st.progress(0)
         
@@ -94,17 +118,22 @@ def process_all_documents(drive_service, folder_id: str):
             file_id = file['id']
             file_name = file['name']
             
+            # Skip embeddings files
+            if file_name in [EMBEDDINGS_FILE, FAISS_INDEX_FILE]:
+                st.info(f"⏭️ Skipping embeddings file: {file_name}")
+                continue
+            
             st.write(f"📄 Processing: {file_name}")
             
             try:
                 # Download file
                 file_content = download_file(drive_service, file_id)
                 
-                # Extract text based on file type
+                # Extract text with metadata based on file type
                 if file['mimeType'] == 'application/pdf':
-                    text = process_pdf(file_content)
+                    text, doc_metadata = process_pdf(file_content)
                 elif file['mimeType'] == 'application/vnd.openxmlformats-officedocument.presentationml.presentation':
-                    text = process_pptx(file_content)
+                    text, doc_metadata = process_pptx(file_content)
                 else:
                     st.warning(f"Skipping unsupported file type: {file_name}")
                     continue
@@ -113,20 +142,52 @@ def process_all_documents(drive_service, folder_id: str):
                     st.warning(f"No text extracted from {file_name}")
                     continue
                 
-                # Chunk the text
-                chunks = chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP)
+                # Store document-level metadata
+                doc_info = {
+                    'file_id': file_id,
+                    'file_name': file_name,
+                    'file_type': file['mimeType'],
+                    'metadata': doc_metadata
+                }
+                document_metadata.append(doc_info)
                 
-                # Store chunks with metadata
-                for chunk_idx, chunk in enumerate(chunks):
-                    all_chunks.append(chunk)
-                    all_metadata.append({
+                # Smart chunking with context preservation
+                chunks = chunk_text_smart(text, doc_metadata, CHUNK_SIZE, CHUNK_OVERLAP)
+                
+                # Store chunks with comprehensive metadata
+                for chunk_data in chunks:
+                    all_chunks.append(chunk_data['text'])
+                    all_chunk_metadata.append({
                         'file_id': file_id,
                         'file_name': file_name,
-                        'chunk_idx': chunk_idx,
-                        'total_chunks': len(chunks)
+                        'file_type': file['mimeType'],
+                        'chunk_index': chunk_data['chunk_index'],
+                        'total_chunks': chunk_data['total_chunks'],
+                        'section_type': chunk_data.get('section_type', 'document'),
+                        'section_number': chunk_data.get('section_number', 0),
+                        'is_complete_section': chunk_data.get('is_complete_section', False),
+                        'token_count': chunk_data.get('token_count', 0),
+                        'word_count': chunk_data.get('word_count', 0),
+                        'has_previous': 'previous_chunk_preview' in chunk_data,
+                        'has_next': 'next_chunk_preview' in chunk_data
                     })
                 
-                st.success(f"✅ {file_name}: {len(chunks)} chunks")
+                st.success(f"✅ {file_name}: {len(chunks)} chunks (smart chunking)")
+                
+                # Show document insights
+                with st.expander(f"📊 Document Insights: {file_name}"):
+                    if 'total_pages' in doc_metadata:
+                        st.write(f"📄 Pages: {doc_metadata['total_pages']}")
+                    if 'total_slides' in doc_metadata:
+                        st.write(f"📽️ Slides: {doc_metadata['total_slides']}")
+                    if doc_metadata.get('has_sections'):
+                        st.write(f"📑 Sections found: {len(doc_metadata.get('sections', []))}")
+                    if doc_metadata.get('key_terms'):
+                        st.write(f"🔑 Key terms: {', '.join(doc_metadata['key_terms'][:10])}")
+                    if doc_metadata.get('has_tables'):
+                        st.write("📊 Contains tables")
+                    if doc_metadata.get('has_lists'):
+                        st.write("📝 Contains lists")
                 
             except Exception as e:
                 st.error(f"Failed to process {file_name}: {e}")
@@ -154,18 +215,20 @@ def process_all_documents(drive_service, folder_id: str):
         faiss.normalize_L2(embeddings_array)
         index.add(embeddings_array)
         
-        # Prepare metadata
+        # Prepare comprehensive metadata
         metadata = {
             'chunks': all_chunks,
-            'metadata': all_metadata,
+            'chunk_metadata': all_chunk_metadata,
+            'document_metadata': document_metadata,
             'chunk_size': CHUNK_SIZE,
             'chunk_overlap': CHUNK_OVERLAP,
-            'total_files': len(files),
-            'total_chunks': len(all_chunks)
+            'total_files': len(document_metadata),
+            'total_chunks': len(all_chunks),
+            'processing_timestamp': time.time()
         }
         
-        # Save to disk
-        save_embeddings_data(metadata, index)
+        # Save to disk and Google Drive
+        save_embeddings_data(metadata, index, drive_service, folder_id)
         
         return metadata, index
         
@@ -174,7 +237,7 @@ def process_all_documents(drive_service, folder_id: str):
         return None, None
 
 def search_documents(query: str, metadata: Dict[str, Any], index) -> List[Dict[str, Any]]:
-    """Search for relevant chunks using FAISS."""
+    """Search for relevant chunks using FAISS with enhanced metadata."""
     try:
         # Get query embedding
         query_embedding = get_embeddings([query])[0]
@@ -186,17 +249,32 @@ def search_documents(query: str, metadata: Dict[str, Any], index) -> List[Dict[s
         # Search in FAISS index
         distances, indices = index.search(query_vector, TOP_K)
         
-        # Prepare results
+        # Prepare results with comprehensive metadata
         results = []
         for i, idx in enumerate(indices[0]):
             if idx < len(metadata['chunks']):
+                chunk_meta = metadata['chunk_metadata'][idx]
                 results.append({
                     'chunk_idx': int(idx),
                     'text': metadata['chunks'][idx],
                     'similarity': float(distances[0][i]),
-                    'file_name': metadata['metadata'][idx]['file_name'],
-                    'file_id': metadata['metadata'][idx]['file_id'],
-                    'chunk_number': metadata['metadata'][idx]['chunk_idx'] + 1,
+                    'file_name': chunk_meta['file_name'],
+                    'file_id': chunk_meta['file_id'],
+                    'file_type': chunk_meta['file_type'],
+                    'chunk_number': chunk_meta['chunk_index'] + 1,
+                    'total_chunks': chunk_meta['total_chunks'],
+                    'section_type': chunk_meta.get('section_type', 'document'),
+                    'section_number': chunk_meta.get('section_number', 0),
+                    'is_complete_section': chunk_meta.get('is_complete_section', False),
+                    'token_count': chunk_meta.get('token_count', 0),
+                    'word_count': chunk_meta.get('word_count', 0)
+                })
+        
+        return results
+        
+    except Exception as e:
+        st.error(f"Search failed: {e}")
+        return []    'chunk_number': metadata['metadata'][idx]['chunk_idx'] + 1,
                     'total_chunks': metadata['metadata'][idx]['total_chunks']
                 })
         
@@ -210,13 +288,28 @@ def generate_answer(query: str, relevant_chunks: List[Dict[str, Any]]) -> str:
     """Generate answer using OpenAI with retrieved chunks as context."""
     context_parts = []
     for chunk in relevant_chunks:
-        context_parts.append(f"[Source: {chunk['file_name']}, Chunk {chunk['chunk_number']}/{chunk['total_chunks']}]\n{chunk['text']}")
+        section_info = ""
+        if chunk.get('section_type') == 'page':
+            section_info = f"Page {chunk['section_number']}"
+        elif chunk.get('section_type') == 'slide':
+            section_info = f"Slide {chunk['section_number']}"
+        
+        context_parts.append(
+            f"[Source: {chunk['file_name']}, {section_info}, "
+            f"Chunk {chunk['chunk_number']}/{chunk['total_chunks']}, "
+            f"Similarity: {chunk['similarity']:.3f}]\n{chunk['text']}"
+        )
     
     context = "\n\n---\n\n".join(context_parts)
     
-    prompt = f"""Based on the following context from multiple documents, please answer the question. 
-If the answer cannot be found in the context, please say so. 
-When answering, mention which document(s) the information comes from.
+    prompt = f"""Based on the following context from multiple documents, please answer the question comprehensively. 
+
+Instructions:
+- Provide detailed, accurate answers based on the context
+- Always cite which document and section the information comes from
+- If information is found across multiple documents, synthesize it coherently
+- If the answer cannot be found in the context, clearly state that
+- Use specific details and examples from the documents when available
 
 Context:
 {context}
@@ -229,10 +322,10 @@ Answer:"""
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are a helpful assistant that answers questions based on provided context from multiple documents. Always cite the source document when providing information."},
+                {"role": "system", "content": "You are a helpful assistant that answers questions based on provided context from multiple documents. Always provide detailed, well-structured answers and cite your sources clearly."},
                 {"role": "user", "content": prompt}
             ],
-            max_tokens=800,
+            max_tokens=1000,
             temperature=0.1
         )
         return response.choices[0].message.content
@@ -273,7 +366,7 @@ def main():
         
         # Try to load cached data
         if st.session_state.metadata is None or st.session_state.faiss_index is None:
-            cached_metadata, cached_index = load_cached_data()
+            cached_metadata, cached_index = load_cached_data(st.session_state.drive_service, DRIVE_FOLDER_ID)
             if cached_metadata and cached_index:
                 st.session_state.metadata = cached_metadata
                 st.session_state.faiss_index = cached_index
@@ -296,16 +389,32 @@ def main():
             st.metric("Total Documents", st.session_state.metadata['total_files'])
             st.metric("Total Chunks", st.session_state.metadata['total_chunks'])
             
-            # Show document list
+            # Show processing timestamp
+            if 'processing_timestamp' in st.session_state.metadata:
+                import datetime
+                ts = datetime.datetime.fromtimestamp(st.session_state.metadata['processing_timestamp'])
+                st.caption(f"Last processed: {ts.strftime('%Y-%m-%d %H:%M:%S')}")
+            
+            # Show document list with detailed info
             with st.expander("📄 Indexed Documents"):
-                docs = {}
-                for meta in st.session_state.metadata['metadata']:
-                    if meta['file_name'] not in docs:
-                        docs[meta['file_name']] = 0
-                    docs[meta['file_name']] += 1
-                
-                for doc_name, chunk_count in sorted(docs.items()):
-                    st.text(f"• {doc_name} ({chunk_count} chunks)")
+                for doc in st.session_state.metadata.get('document_metadata', []):
+                    st.markdown(f"**{doc['file_name']}**")
+                    
+                    # Count chunks for this document
+                    doc_chunks = sum(1 for m in st.session_state.metadata['chunk_metadata'] 
+                                   if m['file_id'] == doc['file_id'])
+                    st.text(f"  • Chunks: {doc_chunks}")
+                    
+                    # Show metadata insights
+                    meta = doc.get('metadata', {})
+                    if 'total_pages' in meta:
+                        st.text(f"  • Pages: {meta['total_pages']}")
+                    if 'total_slides' in meta:
+                        st.text(f"  • Slides: {meta['total_slides']}")
+                    if meta.get('key_terms'):
+                        st.text(f"  • Key terms: {', '.join(meta['key_terms'][:5])}")
+                    
+                    st.markdown("---")
     
     # Main panel - Query interface
     if st.session_state.metadata is None or st.session_state.faiss_index is None:
@@ -364,8 +473,25 @@ def main():
             for doc_name, chunks in docs_referenced.items():
                 with st.expander(f"📄 {doc_name} ({len(chunks)} relevant chunks)"):
                     for i, chunk in enumerate(chunks[:3], 1):  # Show top 3 per document
-                        st.markdown(f"**Chunk {chunk['chunk_number']}/{chunk['total_chunks']}** (Similarity: {chunk['similarity']:.3f})")
-                        st.markdown(f"```\n{chunk['text'][:400]}{'...' if len(chunk['text']) > 400 else ''}\n```")
+                        # Show section info
+                        section_info = ""
+                        if chunk.get('section_type') == 'page':
+                            section_info = f"Page {chunk['section_number']}"
+                        elif chunk.get('section_type') == 'slide':
+                            section_info = f"Slide {chunk['section_number']}"
+                        
+                        st.markdown(
+                            f"**{section_info} - Chunk {chunk['chunk_number']}/{chunk['total_chunks']}** "
+                            f"(Similarity: {chunk['similarity']:.3f}, "
+                            f"Words: {chunk.get('word_count', 'N/A')})"
+                        )
+                        
+                        # Show if it's a complete section
+                        if chunk.get('is_complete_section'):
+                            st.caption("✓ Complete section")
+                        
+                        st.markdown(f"```\n{chunk['text'][:500]}{'...' if len(chunk['text']) > 500 else ''}\n```")
+                        
                         if i < len(chunks):
                             st.markdown("---")
 
