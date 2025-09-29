@@ -2,7 +2,7 @@ import streamlit as st
 from io import BytesIO
 import time
 from typing import List, Dict, Any, Tuple
-TEXT_SLIDE_HEADER = "--- Slide {idx} ---"
+
 # OpenAI (cho embeddings)
 try:
     from openai import OpenAI
@@ -108,7 +108,7 @@ def process_pptx(file_content: BytesIO) -> Tuple[str, Dict[str, Any]]:
     errors: List[str] = []
 
     for s_idx, slide in enumerate(prs.slides, 1):
-        buf: List[str] = [TEXT_SLIDE_HEADER.format(idx=s_idx)]
+        buf: List[str] = [f"--- Slide {s_idx} ---"]
         for shape in slide.shapes:
             # Text
             if getattr(shape, "has_text_frame", False) and getattr(shape, "text_frame", None):
