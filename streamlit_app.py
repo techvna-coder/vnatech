@@ -274,6 +274,21 @@ def search_documents(query: str, metadata: Dict[str, Any], index) -> List[Dict[s
         
     except Exception as e:
         st.error(f"Search failed: {e}")
+        return []
+                    'file_type': chunk_meta['file_type'],
+                    'chunk_number': chunk_meta['chunk_index'] + 1,
+                    'total_chunks': chunk_meta['total_chunks'],
+                    'section_type': chunk_meta.get('section_type', 'document'),
+                    'section_number': chunk_meta.get('section_number', 0),
+                    'is_complete_section': chunk_meta.get('is_complete_section', False),
+                    'token_count': chunk_meta.get('token_count', 0),
+                    'word_count': chunk_meta.get('word_count', 0)
+                })
+        
+        return results
+        
+    except Exception as e:
+        st.error(f"Search failed: {e}")
         return []    'chunk_number': metadata['metadata'][idx]['chunk_idx'] + 1,
                     'total_chunks': metadata['metadata'][idx]['total_chunks']
                 })
