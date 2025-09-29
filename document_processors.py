@@ -98,41 +98,61 @@ def process_pdf(file_content: BytesIO) -> Tuple[str, Dict[str, Any]]:
         raise Exception(f"Failed to process PDF: {str(e)}")
 
 def process_pptx(file_content: BytesIO) -> Tuple[str, Dict[str, Any]]:
-    """Extract text + metadata from PPTX."""
-    if Presentation is None:
-        raise Exception("python-pptx not installed")
-    try:
-        prs = Presentation(file_content)
-        slides_text = []
-        for s_idx, slide in enumerate(prs.slides, 1):
-            buf = [f"--- Slide {s_idx} ---"]
-            for shape in slide.shapes:
-                # textbox
-                if hasattr(shape, "text") and shape.text:
-                    buf.append(shape.text)
-                # table
-                if hasattr(shape, "table") and shape.table:
-                    for row in shape.table.rows:
-                        cells = [cell.text.strip() for cell in row.cells if cell.text]
+    """
+    Đọc PPTX an toàn, dùng has_text_frame/has_table, giữ header --- Slide N --- để tiện chunk theo slide.
+    """
+    prs = Presentation(file_content)
+    slides_text: List[str] = []
+    total_slides = len(list(prs.slides))
+    has_any_table = False
+    errors: List[str] = []
+
+    for s_idx, slide in enumerate(prs.slides, 1):
+        buf: List[str] = [TEXT_SLIDE_HEADER.format(idx=s_idx)]
+        for shape in slide.shapes:
+            # Text
+            if getattr(shape, "has_text_frame", False) and getattr(shape, "text_frame", None):
+                try:
+                    paras = [p.text for p in shape.text_frame.paragraphs if p.text]
+                    txt = "\n".join([_normalize_whitespace(t) for t in paras if _normalize_whitespace(t)])
+                except Exception:
+                    # Fallback an toàn
+                    txt = _normalize_whitespace(getattr(shape, "text", "") or "")
+                if txt:
+                    buf.append(txt)
+
+            # Table
+            if getattr(shape, "has_table", False):
+                try:
+                    t = shape.table
+                    has_any_table = True
+                    for row in t.rows:
+                        cells = [ _normalize_whitespace(cell.text) for cell in row.cells ]
+                        cells = [c for c in cells if c]
                         if cells:
                             buf.append(" | ".join(cells))
-            slide_block = "\n".join([b for b in buf if b and b.strip() != f"--- Slide {s_idx} ---"])
-            if slide_block.strip():
-                slides_text.append(slide_block)
-        full_text = "\n".join(slides_text).strip()
-        if not full_text:
-            raise Exception("No text could be extracted from the PowerPoint")
-        meta = {
-            "total_slides": len(list(prs.slides)),
-            "has_sections": True,
-            "sections": [{"type": "slide", "number": i} for i in range(1, len(list(prs.slides))+1)],
-            "has_tables": any(getattr(sh, "table", None) for sl in prs.slides for sh in sl.shapes),
-            "has_lists": False,
-            "key_terms": []
-        }
-        return full_text, meta
-    except Exception as e:
-        raise Exception(f"Failed to process PPTX: {str(e)}")
+                except Exception as e:
+                    errors.append(f"slide {s_idx} table: {e}")
+                    # Bỏ qua lỗi cục bộ, không ngắt toàn bộ file
+
+        # Gom slide
+        slide_block = "\n".join([b for b in buf if b and b.strip()])
+        if slide_block.strip():
+            slides_text.append(slide_block)
+
+    full_text = "\n".join(slides_text).strip()
+    if not full_text:
+        raise Exception("No text could be extracted from the PowerPoint")
+
+    meta = {
+        "total_slides": total_slides,
+        "has_sections": True,
+        "sections": [{"type": "slide", "number": i} for i in range(1, total_slides + 1)],
+        "has_tables": has_any_table,
+        "errors": errors,
+        "key_terms": [],
+    }
+    return full_text, meta
 
 # ---------- Chunking ----------
 def _chunk_by_tokens(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
