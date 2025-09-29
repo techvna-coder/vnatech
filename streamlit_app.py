@@ -121,7 +121,12 @@ def auth_gate() -> Tuple[bool, str]:
     )
 
     # login(form_name, location)
-    name, auth_status, username = authenticator.login(location="main", key="login")
+    name, auth_status, username = authenticator.login('main', fields={
+    'Form name': 'Đăng nhập',
+    'Username': 'Username',
+    'Password': 'Password',
+    'Login': 'Login'
+})
 
     if auth_status:
         with st.sidebar:
