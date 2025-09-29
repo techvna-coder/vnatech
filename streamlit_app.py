@@ -3,19 +3,12 @@ import os
 import pickle
 from io import BytesIO
 from typing import List, Dict, Any, Tuple
+import time
+import datetime
 
 import streamlit as st
 import numpy as np
 import pandas as pd
-
-# Deps expected:
-#   bcrypt>=4.0.1
-#   faiss-cpu>=1.7.4
-#   openai>=1.12.0
-#   google-api-python-client>=2.129.0
-#   google-auth>=2.29.0
-#   google-auth-httplib2>=0.2.0
-#   streamlit>=1.31.0
 
 # FAISS
 try:
@@ -69,11 +62,79 @@ except Exception as e:
 # =========================
 # App Constants & Settings
 # =========================
-EMBEDDINGS_FILE = "embeddings_meta.pkl"
-FAISS_INDEX_FILE = "faiss_index.bin"
+# Persistent cache directory
+CACHE_DIR = os.path.join(os.getcwd(), ".cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+EMBEDDINGS_FILE = os.path.join(CACHE_DIR, "embeddings_meta.pkl")
+FAISS_INDEX_FILE = os.path.join(CACHE_DIR, "faiss_index.bin")
+CACHE_MARKER = os.path.join(CACHE_DIR, ".last_build")
 TOP_K = 10
 
 st.set_page_config(page_title="VNA Tech RAG", layout="wide")
+
+
+# =========================
+# Cache Management Functions
+# =========================
+def format_bytes(size: int) -> str:
+    """Format bytes thành đơn vị dễ đọc."""
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size < 1024.0:
+            return f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} TB"
+
+
+def get_cache_info() -> Dict[str, Any]:
+    """Lấy thông tin về cache hiện tại."""
+    info = {
+        "exists": False,
+        "embeddings_size": 0,
+        "faiss_size": 0,
+        "total_size": 0,
+        "last_build": None,
+        "location": CACHE_DIR
+    }
+    
+    if os.path.exists(EMBEDDINGS_FILE):
+        info["exists"] = True
+        info["embeddings_size"] = os.path.getsize(EMBEDDINGS_FILE)
+    
+    if os.path.exists(FAISS_INDEX_FILE):
+        info["faiss_size"] = os.path.getsize(FAISS_INDEX_FILE)
+    
+    info["total_size"] = info["embeddings_size"] + info["faiss_size"]
+    
+    if os.path.exists(CACHE_MARKER):
+        try:
+            with open(CACHE_MARKER, 'r') as f:
+                build_time = float(f.read())
+            info["last_build"] = datetime.datetime.fromtimestamp(build_time)
+        except:
+            pass
+    
+    return info
+
+
+def save_cache_marker():
+    """Lưu timestamp khi build cache."""
+    try:
+        with open(CACHE_MARKER, 'w') as f:
+            f.write(str(time.time()))
+    except:
+        pass
+
+
+def clear_local_cache():
+    """Xóa toàn bộ cache local."""
+    files = [EMBEDDINGS_FILE, FAISS_INDEX_FILE, CACHE_MARKER]
+    for f in files:
+        if os.path.exists(f):
+            try:
+                os.remove(f)
+            except:
+                pass
 
 
 # =========================
@@ -170,31 +231,60 @@ def _list_drive_files() -> List[Dict[str, Any]]:
 # Embeddings Store & FAISS
 # =========================
 def _try_load_local_index():
+    """Load cache từ .cache/ directory."""
     if os.path.exists(EMBEDDINGS_FILE) and os.path.exists(FAISS_INDEX_FILE):
         try:
             with open(EMBEDDINGS_FILE, "rb") as f:
                 meta = pickle.load(f)
             index = faiss.read_index(FAISS_INDEX_FILE)
+            
+            # Hiển thị thông tin cache
+            cache_info = get_cache_info()
+            if cache_info["last_build"]:
+                st.info("📦 Cache được tạo lúc: %s" % cache_info["last_build"].strftime('%Y-%m-%d %H:%M:%S'))
+            
             return index, meta
-        except Exception:
+        except Exception as e:
+            st.warning("Không thể load cache: %s" % e)
             return None, None
     return None, None
 
 def _load_or_pull_cache_from_drive() -> Tuple[Any, List[Dict[str, Any]]]:
+    """Load cache từ local, nếu không có thì thử download từ Drive."""
+    # Thử load local trước
     idx, meta = _try_load_local_index()
     if idx is not None and meta is not None:
         return idx, meta
+    
+    # Nếu không có local, thử restore từ Drive
+    st.info("🔄 Đang thử khôi phục cache từ Google Drive...")
     service = _drive_service()
     folder_id = st.secrets.get("DRIVE_FOLDER_ID")
-    paths = download_embeddings_from_drive(service, folder_id, EMBEDDINGS_FILE, FAISS_INDEX_FILE)
-    if paths.get("embeddings_path") and paths.get("faiss_path"):
-        try:
-            with open(EMBEDDINGS_FILE, "rb") as f:
-                meta = pickle.load(f)
-            idx = faiss.read_index(FAISS_INDEX_FILE)
-            return idx, meta
-        except Exception:
-            pass
+    
+    try:
+        paths = download_embeddings_from_drive(
+            service, 
+            folder_id, 
+            os.path.basename(EMBEDDINGS_FILE),
+            os.path.basename(FAISS_INDEX_FILE)
+        )
+        
+        # Di chuyển file vào CACHE_DIR nếu cần
+        if paths.get("embeddings_path") and paths.get("faiss_path"):
+            import shutil
+            if paths["embeddings_path"] != EMBEDDINGS_FILE:
+                shutil.move(paths["embeddings_path"], EMBEDDINGS_FILE)
+            if paths["faiss_path"] != FAISS_INDEX_FILE:
+                shutil.move(paths["faiss_path"], FAISS_INDEX_FILE)
+            
+            # Thử load lại
+            idx, meta = _try_load_local_index()
+            if idx is not None and meta is not None:
+                st.success("✅ Đã khôi phục cache từ Google Drive!")
+                return idx, meta
+    except Exception as e:
+        st.info("Không thể khôi phục từ Drive: %s" % e)
+    
     return None, None
 
 def _build_or_load_index(process_all: bool = False) -> Tuple[Any, List[Dict[str, Any]]]:
@@ -253,14 +343,26 @@ def _build_or_load_index(process_all: bool = False) -> Tuple[Any, List[Dict[str,
     index = faiss.IndexFlatIP(mat.shape[1])
     index.add(mat)
 
+    # Lưu vào .cache/ directory
     with open(EMBEDDINGS_FILE, "wb") as f:
         pickle.dump(all_meta, f)
     faiss.write_index(index, FAISS_INDEX_FILE)
+    save_cache_marker()
+    
+    st.success("✅ Đã lưu cache tại: %s" % CACHE_DIR)
 
+    # Optional: thử backup lên Drive (không quan trọng nếu fail)
     try:
-        upload_embeddings_to_drive(service, drive_folder, EMBEDDINGS_FILE, FAISS_INDEX_FILE)
+        st.info("📤 Đang backup cache lên Google Drive...")
+        upload_embeddings_to_drive(
+            service, 
+            drive_folder, 
+            EMBEDDINGS_FILE,
+            FAISS_INDEX_FILE
+        )
+        st.success("✅ Đã backup cache lên Google Drive!")
     except Exception as e:
-        st.info("Upload cache to Drive skipped or failed: %s" % e)
+        st.info("ℹ️ Backup lên Drive bỏ qua (app vẫn hoạt động bình thường)")
 
     return index, all_meta
 
@@ -324,29 +426,38 @@ def _ask_llm(client: OpenAI, question: str, chunks: List[Dict[str, Any]]) -> str
 # =========================
 def sidebar_panel(index, meta):
     st.sidebar.header("VNA Tech – RAG")
+    
+    # Hiển thị thông tin cache
     with st.sidebar.expander("Bộ nhớ đệm", expanded=True):
-        st.write("- **Embeddings**: `%s`" % EMBEDDINGS_FILE)
-        st.write("- **FAISS index**: `%s`" % FAISS_INDEX_FILE)
+        cache_info = get_cache_info()
+        
+        if cache_info["exists"]:
+            st.success("✅ Cache đã tồn tại")
+            st.write("- **Vị trí**: `.cache/`")
+            st.write("- **Embeddings**: %s" % format_bytes(cache_info["embeddings_size"]))
+            st.write("- **FAISS index**: %s" % format_bytes(cache_info["faiss_size"]))
+            st.write("- **Tổng cộng**: %s" % format_bytes(cache_info["total_size"]))
+            if cache_info["last_build"]:
+                st.write("- **Build lúc**: %s" % cache_info["last_build"].strftime('%Y-%m-%d %H:%M'))
+        else:
+            st.warning("⚠️ Chưa có cache")
+        
         st.write("- **Số chunk**: %s" % (len(meta) if meta else 0))
+        
         st.divider()
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("Xây dựng lại index", use_container_width=True):
+            if st.button("🔄 Rebuild", use_container_width=True):
                 st.session_state["force_rebuild"] = True
                 st.rerun()
         with col2:
-            if st.button("Xoá cache (local)", type="secondary", use_container_width=True):
-                try:
-                    if os.path.exists(EMBEDDINGS_FILE):
-                        os.remove(EMBEDDINGS_FILE)
-                    if os.path.exists(FAISS_INDEX_FILE):
-                        os.remove(FAISS_INDEX_FILE)
-                except Exception:
-                    pass
-                st.success("Đã xoá cache local.")
+            if st.button("🗑️ Xóa cache", type="secondary", use_container_width=True):
+                clear_local_cache()
+                st.success("Đã xóa cache local.")
                 st.rerun()
 
     st.sidebar.divider()
+    
     try:
         files = _list_drive_files()
     except Exception as e:
@@ -419,7 +530,7 @@ def main():
 
         with st.expander("Xem chi tiết các đoạn trích"):
             for i, c in enumerate(results, start=1):
-                st.markdown("**%d. %s** — %s %s · Chunk %s/%s · sim=%.3f" % (
+                st.markdown("**%d. %s** – %s %s · Chunk %s/%s · sim=%.3f" % (
                     i,
                     c["file_name"],
                     str(c.get("section_type","?")).title(),
