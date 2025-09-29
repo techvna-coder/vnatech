@@ -1,17 +1,35 @@
 import streamlit as st
-from openai import OpenAI
-import PyPDF2
-from pptx import Presentation
-import tiktoken
-from typing import List, Dict, Any
 from io import BytesIO
 import time
+from typing import List, Dict, Any
 
-# Initialize OpenAI client
-client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+# Try importing OpenAI
+try:
+    from openai import OpenAI
+    client = OpenAI(api_key=st.secrets.get("OPENAI_API_KEY", ""))
+except ImportError:
+    st.error("OpenAI library not installed")
+    client = None
 
-# Initialize tokenizer for text-embedding-3-small
-tokenizer = tiktoken.encoding_for_model("text-embedding-3-small")
+# Try importing other required modules
+try:
+    import PyPDF2
+except ImportError:
+    st.error("PyPDF2 not installed")
+    PyPDF2 = None
+
+try:
+    from pptx import Presentation
+except ImportError:
+    st.error("python-pptx not installed")
+    Presentation = None
+
+try:
+    import tiktoken
+    tokenizer = tiktoken.encoding_for_model("text-embedding-3-small")
+except ImportError:
+    st.error("tiktoken not installed")
+    tokenizer = None
 
 def process_pdf(file_content: BytesIO) -> str:
     """Extract text from PDF file."""
