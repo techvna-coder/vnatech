@@ -209,7 +209,7 @@ def process_all_documents(drive_service, folder_id: str):
         # Create FAISS index
         st.write("🔍 Creating FAISS index...")
         dimension = embeddings_array.shape[1]
-        index = faiss.IndexFlatIP(dimension)  # Inner product for cosine similarity
+        index = faiss.IndexFlatIP(dimension)
         
         # Normalize vectors for cosine similarity
         faiss.normalize_L2(embeddings_array)
@@ -268,29 +268,6 @@ def search_documents(query: str, metadata: Dict[str, Any], index) -> List[Dict[s
                     'is_complete_section': chunk_meta.get('is_complete_section', False),
                     'token_count': chunk_meta.get('token_count', 0),
                     'word_count': chunk_meta.get('word_count', 0)
-                })
-        
-        return results
-        
-    except Exception as e:
-        st.error(f"Search failed: {e}")
-        return []
-                    'file_type': chunk_meta['file_type'],
-                    'chunk_number': chunk_meta['chunk_index'] + 1,
-                    'total_chunks': chunk_meta['total_chunks'],
-                    'section_type': chunk_meta.get('section_type', 'document'),
-                    'section_number': chunk_meta.get('section_number', 0),
-                    'is_complete_section': chunk_meta.get('is_complete_section', False),
-                    'token_count': chunk_meta.get('token_count', 0),
-                    'word_count': chunk_meta.get('word_count', 0)
-                })
-        
-        return results
-        
-    except Exception as e:
-        st.error(f"Search failed: {e}")
-        return []    'chunk_number': metadata['metadata'][idx]['chunk_idx'] + 1,
-                    'total_chunks': metadata['metadata'][idx]['total_chunks']
                 })
         
         return results
@@ -439,7 +416,7 @@ def main():
         1. **Connect to Google Drive** - Automatically done
         2. **Process All Documents** - Extract and embed all PDFs and PPTX files
         3. **Ask Questions** - Search across all documents simultaneously
-        4. **Cached Results** - Embeddings are saved locally, no need to reprocess
+        4. **Cached Results** - Embeddings are saved to Google Drive, no need to reprocess
         """)
         return
     
@@ -487,7 +464,7 @@ def main():
             
             for doc_name, chunks in docs_referenced.items():
                 with st.expander(f"📄 {doc_name} ({len(chunks)} relevant chunks)"):
-                    for i, chunk in enumerate(chunks[:3], 1):  # Show top 3 per document
+                    for i, chunk in enumerate(chunks[:3], 1):
                         # Show section info
                         section_info = ""
                         if chunk.get('section_type') == 'page':
