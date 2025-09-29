@@ -1,8 +1,4 @@
-# Write a complete drive_utils.py with robust upload (update-or-create), listing, download,
-# and authentication via Service Account from Streamlit secrets.
-from pathlib import Path
 
-drive_utils_code = r"""
 import io
 import os
 import time
@@ -174,6 +170,3 @@ def upload_file(service, folder_id: str, local_path: str, mime_type: str = "appl
         return service.files().create(body=file_metadata, media_body=media, fields="id").execute()
     created = _retry(_create)
     return created["id"]
-"""
-Path("/mnt/data/drive_utils.py").write_text(drive_utils_code, encoding="utf-8")
-print("Created updated drive_utils.py at /mnt/data")
