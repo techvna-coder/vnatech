@@ -31,12 +31,8 @@ def authenticate_drive():
             scopes=['https://www.googleapis.com/auth/drive.readonly']
         )
         
-        # Create HTTP client with proper SSL handling
-        http = httplib2.Http(ca_certs=certifi.where())
-        http = credentials.authorize(http)
-        
-        # Build the Drive service with the authorized HTTP client
-        service = build('drive', 'v3', http=http)
+        # Build the Drive service directly with credentials
+        service = build('drive', 'v3', credentials=credentials)
         
         return service
         
