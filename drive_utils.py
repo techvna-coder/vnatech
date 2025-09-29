@@ -2,12 +2,12 @@ import streamlit as st
 import json
 import ssl
 import certifi
+import time
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, HttpError
 from typing import List, Dict, Any
 from io import BytesIO
-import httplib2
 
 def authenticate_drive():
     """Authenticate with Google Drive using service account credentials."""
@@ -32,66 +32,82 @@ def authenticate_drive():
         )
         
         # Build the Drive service directly with credentials
-        service = build('drive', 'v3', credentials=credentials)
+        service = build('drive', 'v3', credentials=credentials, cache_discovery=False)
         
         return service
         
     except Exception as e:
         raise Exception(f"Failed to authenticate with Google Drive: {str(e)}")
 
-def list_files_in_folder(service, folder_id: str) -> List[Dict[str, Any]]:
-    """List all PDF and PPTX files in a Google Drive folder."""
-    try:
-        # Query for PDF and PPTX files in the specified folder
-        query = f"'{folder_id}' in parents and (mimeType='application/pdf' or mimeType='application/vnd.openxmlformats-officedocument.presentationml.presentation') and trashed=false"
-        
-        results = service.files().list(
-            q=query,
-            fields="files(id, name, mimeType, size, modifiedTime)",
-            pageSize=100
-        ).execute()
-        
-        files = results.get('files', [])
-        
-        formatted_files = []
-        for file in files:
-            formatted_files.append({
-                'id': file['id'],
-                'name': file['name'],
-                'mimeType': file['mimeType'],
-                'size': file.get('size', 'Unknown'),
-                'modifiedDate': file.get('modifiedTime', 'Unknown')
-            })
-        
-        # Sort files by name
-        formatted_files.sort(key=lambda x: x['name'].lower())
-        
-        return formatted_files
-        
-    except HttpError as e:
-        raise Exception(f"HTTP Error {e.resp.status}: {e.error_details}")
-    except Exception as e:
-        raise Exception(f"Failed to list files in folder: {str(e)}")
+def list_files_in_folder(service, folder_id: str, max_retries: int = 3) -> List[Dict[str, Any]]:
+    """List all PDF and PPTX files in a Google Drive folder with retry logic."""
+    for attempt in range(max_retries):
+        try:
+            # Query for PDF and PPTX files in the specified folder
+            query = f"'{folder_id}' in parents and (mimeType='application/pdf' or mimeType='application/vnd.openxmlformats-officedocument.presentationml.presentation') and trashed=false"
+            
+            results = service.files().list(
+                q=query,
+                fields="files(id, name, mimeType, size, modifiedTime)",
+                pageSize=100
+            ).execute()
+            
+            files = results.get('files', [])
+            
+            formatted_files = []
+            for file in files:
+                formatted_files.append({
+                    'id': file['id'],
+                    'name': file['name'],
+                    'mimeType': file['mimeType'],
+                    'size': file.get('size', 'Unknown'),
+                    'modifiedDate': file.get('modifiedTime', 'Unknown')
+                })
+            
+            # Sort files by name
+            formatted_files.sort(key=lambda x: x['name'].lower())
+            
+            return formatted_files
+            
+        except (ssl.SSLError, ConnectionError) as e:
+            if attempt < max_retries - 1:
+                st.warning(f"Connection issue (attempt {attempt + 1}/{max_retries}), retrying...")
+                time.sleep(2 ** attempt)  # Exponential backoff
+                continue
+            else:
+                raise Exception(f"Failed after {max_retries} attempts: {str(e)}")
+        except HttpError as e:
+            raise Exception(f"HTTP Error {e.resp.status}: {e.error_details}")
+        except Exception as e:
+            raise Exception(f"Failed to list files in folder: {str(e)}")
 
-def download_file(service, file_id: str) -> BytesIO:
-    """Download a file from Google Drive and return as BytesIO object."""
-    try:
-        # Request file content
-        request = service.files().get_media(fileId=file_id)
-        
-        # Download to BytesIO
-        file_content = BytesIO()
-        downloader = MediaIoBaseDownload(file_content, request)
-        
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
-        
-        file_content.seek(0)
-        return file_content
-        
-    except Exception as e:
-        raise Exception(f"Failed to download file {file_id}: {str(e)}")
+def download_file(service, file_id: str, max_retries: int = 3) -> BytesIO:
+    """Download a file from Google Drive and return as BytesIO object with retry logic."""
+    for attempt in range(max_retries):
+        try:
+            # Request file content
+            request = service.files().get_media(fileId=file_id)
+            
+            # Download to BytesIO
+            file_content = BytesIO()
+            downloader = MediaIoBaseDownload(file_content, request)
+            
+            done = False
+            while not done:
+                status, done = downloader.next_chunk()
+            
+            file_content.seek(0)
+            return file_content
+            
+        except (ssl.SSLError, ConnectionError) as e:
+            if attempt < max_retries - 1:
+                st.warning(f"Download connection issue (attempt {attempt + 1}/{max_retries}), retrying...")
+                time.sleep(2 ** attempt)
+                continue
+            else:
+                raise Exception(f"Failed to download after {max_retries} attempts: {str(e)}")
+        except Exception as e:
+            raise Exception(f"Failed to download file {file_id}: {str(e)}")
 
 def get_file_metadata(service, file_id: str) -> Dict[str, Any]:
     """Get metadata for a specific file."""
