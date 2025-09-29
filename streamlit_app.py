@@ -93,7 +93,7 @@ def auth_gate() -> Tuple[bool, str]:
         st.error("No users configured under [auth.users].")
         st.stop()
 
-    # Build credentials dict (API v0.3+)
+    # Build credentials for v0.3+ (usernames -> {name, password})
     credentials = {"usernames": {}}
     for _, u in users.items():
         uname = u.get("username")
@@ -107,7 +107,7 @@ def auth_gate() -> Tuple[bool, str]:
         st.error("No valid users in [auth.users]. Each user needs 'username' and bcrypt 'password'.")
         st.stop()
 
-    # Instantiate (API v0.3+)
+    # Instantiate
     authenticator = stauth.Authenticate(
         credentials,
         cookie_name,
@@ -115,20 +115,13 @@ def auth_gate() -> Tuple[bool, str]:
         cookie_expiry_days,
     )
 
-    # Call .login with best-effort compatibility across versions
-    name = None
-    auth_status = None
-    username = None
+    # GỌI login với key cố định để tránh trùng form
     try:
-        # Newer API (0.3.x–0.4.x): first positional arg is location
-        name, auth_status, username = authenticator.login('main')
+        # API mới (0.3.x–0.4.x): location là tham số vị trí đầu tiên
+        name, auth_status, username = authenticator.login('main', max_login_attempts=3, key='auth_login')
     except TypeError:
-        try:
-            # Some builds accept keyword 'location'
-            name, auth_status, username = authenticator.login(location='main')
-        except TypeError:
-            # Legacy API (0.2.x): login(form_name, location)
-            name, auth_status, username = authenticator.login('Login', 'main')
+        # fallback một số build yêu cầu keyword location
+        name, auth_status, username = authenticator.login(location='main', max_login_attempts=3, key='auth_login')
 
     if auth_status:
         with st.sidebar:
@@ -141,6 +134,7 @@ def auth_gate() -> Tuple[bool, str]:
     else:
         st.info("Please sign in to continue.")
         return False, ""
+
 
 # =========================
 # Google Drive Helpers
