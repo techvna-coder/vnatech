@@ -2,7 +2,7 @@ import streamlit as st
 from io import BytesIO
 import time
 from typing import List, Dict, Any, Tuple
-
+TEXT_SLIDE_HEADER = "--- Slide {idx} ---"
 # OpenAI (cho embeddings)
 try:
     from openai import OpenAI
