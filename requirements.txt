@@ -9,11 +9,11 @@ google-auth-oauthlib>=1.1.0
 httplib2>=0.22.0
 certifi>=2023.7.22
 faiss-cpu>=1.7.4
-streamlit-authenticator==0.3.2
 bcrypt>=4.0.1
 google-api-python-client>=2.129.0
 google-auth>=2.29.0
 google-auth-httplib2>=0.2.0
+streamlit-authenticator==0.4.2
 
 
 
