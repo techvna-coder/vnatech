@@ -44,10 +44,10 @@ try:
         authenticate_drive,
         list_files_in_folder,
         download_file,
-        upload_file,
         format_file_size,
-        download_embeddings_from_drive,
-        upload_embeddings_to_drive,
+        download_embeddings_from_drive,   # keep: chỉ tải về, KHÔNG upload
+        # upload_file,                    # removed (không dùng)
+        # upload_embeddings_to_drive,     # removed (không dùng)
     )
 except Exception as e:
     st.error("Failed to import drive_utils: %s" % e)
@@ -181,9 +181,11 @@ def _try_load_local_index():
     return None, None
 
 def _load_or_pull_cache_from_drive() -> Tuple[Any, List[Dict[str, Any]]]:
+    # 1) thử local trước
     idx, meta = _try_load_local_index()
     if idx is not None and meta is not None:
         return idx, meta
+    # 2) nếu local không có thì thử kéo từ Drive (nếu tồn tại)
     service = _drive_service()
     folder_id = st.secrets.get("DRIVE_FOLDER_ID")
     paths = download_embeddings_from_drive(service, folder_id, EMBEDDINGS_FILE, FAISS_INDEX_FILE)
@@ -198,13 +200,14 @@ def _load_or_pull_cache_from_drive() -> Tuple[Any, List[Dict[str, Any]]]:
     return None, None
 
 def _build_or_load_index(process_all: bool = False) -> Tuple[Any, List[Dict[str, Any]]]:
+    # Không ép rebuild thì ưu tiên dùng cache (local → Drive)
     if not process_all:
         idx, meta = _load_or_pull_cache_from_drive()
         if idx is not None and meta is not None:
             return idx, meta
 
+    # Build mới từ tài liệu trên Drive
     service = _drive_service()
-    drive_folder = st.secrets.get("DRIVE_FOLDER_ID")
     files = _list_drive_files()
 
     all_vectors = []
@@ -257,10 +260,8 @@ def _build_or_load_index(process_all: bool = False) -> Tuple[Any, List[Dict[str,
         pickle.dump(all_meta, f)
     faiss.write_index(index, FAISS_INDEX_FILE)
 
-    try:
-        upload_embeddings_to_drive(service, drive_folder, EMBEDDINGS_FILE, FAISS_INDEX_FILE)
-    except Exception as e:
-        st.info("Upload cache to Drive skipped or failed: %s" % e)
+    # ⛔️ ĐÃ BỎ: upload cache lên Google Drive để tránh lỗi quota SA
+    # (giữ local-only; nếu cần persistence dài hạn, dùng Shared Drive + upload riêng ngoài app)
 
     return index, all_meta
 
@@ -328,6 +329,7 @@ def sidebar_panel(index, meta):
         st.write("- **Embeddings**: `%s`" % EMBEDDINGS_FILE)
         st.write("- **FAISS index**: `%s`" % FAISS_INDEX_FILE)
         st.write("- **Số chunk**: %s" % (len(meta) if meta else 0))
+        st.caption("Cache hiện được lưu **local-only** trong phiên chạy (không upload lên Drive).")
         st.divider()
         col1, col2 = st.columns(2)
         with col1:
