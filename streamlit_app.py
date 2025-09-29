@@ -373,7 +373,7 @@ def main():
 
     st.title("VNA TechInsight Hub")
     st.caption("Truy vấn trực tiếp các tài liệu PDF/PPTX trong Google Drive.")
-    st.link_button("📂 Mở thư mục Google Drive", drive_url)
+    st.link_button("📂 Mở thư mục Google Drive để cập nhật kiến thức cho Chatbot", drive_url)
 
     
     api_key = st.secrets.get("OPENAI_API_KEY")
