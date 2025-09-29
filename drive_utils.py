@@ -3,6 +3,8 @@ import json
 import ssl
 import certifi
 import time
+import os
+from typing import Tuple
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, HttpError
@@ -108,6 +110,121 @@ def download_file(service, file_id: str, max_retries: int = 3) -> BytesIO:
                 raise Exception(f"Failed to download after {max_retries} attempts: {str(e)}")
         except Exception as e:
             raise Exception(f"Failed to download file {file_id}: {str(e)}")
+
+
+def upload_file_to_drive(service, file_path: str, folder_id: str, file_name: str = None) -> str:
+    """Upload a file to Google Drive folder and return the file ID."""
+    try:
+        from googleapiclient.http import MediaFileUpload
+        
+        if file_name is None:
+            file_name = os.path.basename(file_path)
+        
+        # Check if file already exists in the folder
+        existing_file_id = find_file_by_name(service, folder_id, file_name)
+        
+        file_metadata = {
+            'name': file_name,
+            'parents': [folder_id]
+        }
+        
+        media = MediaFileUpload(file_path, resumable=True)
+        
+        if existing_file_id:
+            # Update existing file
+            file = service.files().update(
+                fileId=existing_file_id,
+                media_body=media
+            ).execute()
+            st.info(f"Updated existing file: {file_name}")
+        else:
+            # Create new file
+            file = service.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields='id, name'
+            ).execute()
+            st.success(f"Uploaded new file: {file_name}")
+        
+        return file['id']
+        
+    except Exception as e:
+        raise Exception(f"Failed to upload file {file_name}: {str(e)}")
+
+
+def find_file_by_name(service, folder_id: str, file_name: str) -> str:
+    """Find a file by name in a specific folder. Returns file ID or None."""
+    try:
+        query = f"name='{file_name}' and '{folder_id}' in parents and trashed=false"
+        
+        results = service.files().list(
+            q=query,
+            fields="files(id, name)",
+            pageSize=1
+        ).execute()
+        
+        files = results.get('files', [])
+        
+        if files:
+            return files[0]['id']
+        return None
+        
+    except Exception as e:
+        st.warning(f"Error searching for file {file_name}: {e}")
+        return None
+
+
+def download_embeddings_from_drive(service, folder_id: str, embeddings_file: str, faiss_file: str) -> Tuple[bool, bool]:
+    """
+    Download embeddings files from Google Drive if they exist.
+    Returns: (embeddings_exists, faiss_exists)
+    """
+    try:
+        # Check for embeddings file
+        embeddings_id = find_file_by_name(service, folder_id, embeddings_file)
+        faiss_id = find_file_by_name(service, folder_id, faiss_file)
+        
+        embeddings_exists = False
+        faiss_exists = False
+        
+        if embeddings_id:
+            st.info(f"📥 Downloading {embeddings_file} from Google Drive...")
+            content = download_file(service, embeddings_id)
+            with open(embeddings_file, 'wb') as f:
+                f.write(content.read())
+            embeddings_exists = True
+            st.success(f"✅ Downloaded {embeddings_file}")
+        
+        if faiss_id:
+            st.info(f"📥 Downloading {faiss_file} from Google Drive...")
+            content = download_file(service, faiss_id)
+            with open(faiss_file, 'wb') as f:
+                f.write(content.read())
+            faiss_exists = True
+            st.success(f"✅ Downloaded {faiss_file}")
+        
+        return embeddings_exists, faiss_exists
+        
+    except Exception as e:
+        st.error(f"Error downloading embeddings from Drive: {e}")
+        return False, False
+
+
+def upload_embeddings_to_drive(service, folder_id: str, embeddings_file: str, faiss_file: str):
+    """Upload embeddings files to Google Drive."""
+    try:
+        st.info("📤 Uploading embeddings to Google Drive...")
+        
+        if os.path.exists(embeddings_file):
+            upload_file_to_drive(service, embeddings_file, folder_id, os.path.basename(embeddings_file))
+        
+        if os.path.exists(faiss_file):
+            upload_file_to_drive(service, faiss_file, folder_id, os.path.basename(faiss_file))
+        
+        st.success("✅ Embeddings saved to Google Drive!")
+        
+    except Exception as e:
+        st.error(f"Error uploading embeddings to Drive: {e}")
 
 def get_file_metadata(service, file_id: str) -> Dict[str, Any]:
     """Get metadata for a specific file."""
