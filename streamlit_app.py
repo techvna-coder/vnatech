@@ -368,9 +368,14 @@ def main():
     if not ok:
         st.stop()
 
+    DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "1JXkaAwVD2lLbFg5bJrNRaSdxJ_oS7kEY")
+    drive_url = f"https://drive.google.com/drive/folders/{DRIVE_FOLDER_ID}?usp=sharing"
+
     st.title("VNA TechInsight Hub")
     st.caption("Truy vấn trực tiếp các tài liệu PDF/PPTX trong Google Drive.")
+    st.link_button("📂 Mở thư mục Google Drive", drive_url)
 
+    
     api_key = st.secrets.get("OPENAI_API_KEY")
     if not api_key:
         st.error("OPENAI_API_KEY is missing in secrets.")
