@@ -1,11 +1,12 @@
 import streamlit as st
 import json
-from pydrive2.auth import ServiceAuth
-from pydrive2.drive import GoogleDrive
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 from typing import List, Dict, Any
 from io import BytesIO
 
-def authenticate_drive() -> GoogleDrive:
+def authenticate_drive():
     """Authenticate with Google Drive using service account credentials."""
     try:
         # Get service account JSON from secrets
@@ -21,85 +22,100 @@ def authenticate_drive() -> GoogleDrive:
         if 'private_key' in service_account_dict:
             service_account_dict['private_key'] = service_account_dict['private_key'].replace('\\n', '\n')
         
-        # Authenticate using service account
-        auth = ServiceAuth(keyfile_dict=service_account_dict)
-        auth.authenticate()
+        # Create credentials
+        credentials = service_account.Credentials.from_service_account_info(
+            service_account_dict,
+            scopes=['https://www.googleapis.com/auth/drive.readonly']
+        )
         
-        # Create GoogleDrive instance
-        drive = GoogleDrive(auth)
+        # Build the Drive service
+        service = build('drive', 'v3', credentials=credentials)
         
-        return drive
+        return service
         
     except Exception as e:
         raise Exception(f"Failed to authenticate with Google Drive: {str(e)}")
 
-def list_files_in_folder(drive: GoogleDrive, folder_id: str) -> List[Dict[str, Any]]:
+def list_files_in_folder(service, folder_id: str) -> List[Dict[str, Any]]:
     """List all PDF and PPTX files in a Google Drive folder."""
     try:
         # Query for PDF and PPTX files in the specified folder
         query = f"'{folder_id}' in parents and (mimeType='application/pdf' or mimeType='application/vnd.openxmlformats-officedocument.presentationml.presentation') and trashed=false"
         
-        file_list = drive.ListFile({'q': query}).GetList()
+        results = service.files().list(
+            q=query,
+            fields="files(id, name, mimeType, size, modifiedTime)",
+            pageSize=100
+        ).execute()
         
-        files = []
-        for file in file_list:
-            files.append({
+        files = results.get('files', [])
+        
+        formatted_files = []
+        for file in files:
+            formatted_files.append({
                 'id': file['id'],
-                'name': file['title'],
+                'name': file['name'],
                 'mimeType': file['mimeType'],
-                'size': file.get('fileSize', 'Unknown'),
-                'modifiedDate': file.get('modifiedDate', 'Unknown')
+                'size': file.get('size', 'Unknown'),
+                'modifiedDate': file.get('modifiedTime', 'Unknown')
             })
         
         # Sort files by name
-        files.sort(key=lambda x: x['name'].lower())
+        formatted_files.sort(key=lambda x: x['name'].lower())
         
-        return files
+        return formatted_files
         
     except Exception as e:
         raise Exception(f"Failed to list files in folder: {str(e)}")
 
-def download_file(drive: GoogleDrive, file_id: str) -> BytesIO:
+def download_file(service, file_id: str) -> BytesIO:
     """Download a file from Google Drive and return as BytesIO object."""
     try:
-        # Get file metadata
-        file = drive.CreateFile({'id': file_id})
+        # Request file content
+        request = service.files().get_media(fileId=file_id)
         
-        # Download file content
+        # Download to BytesIO
         file_content = BytesIO()
-        file.GetContentIOBuffer(file_content)
-        file_content.seek(0)
+        downloader = MediaIoBaseDownload(file_content, request)
         
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+        
+        file_content.seek(0)
         return file_content
         
     except Exception as e:
         raise Exception(f"Failed to download file {file_id}: {str(e)}")
 
-def get_file_metadata(drive: GoogleDrive, file_id: str) -> Dict[str, Any]:
+def get_file_metadata(service, file_id: str) -> Dict[str, Any]:
     """Get metadata for a specific file."""
     try:
-        file = drive.CreateFile({'id': file_id})
-        file.FetchMetadata()
+        file = service.files().get(
+            fileId=file_id,
+            fields='id, name, mimeType, size, modifiedTime, createdTime, owners'
+        ).execute()
         
         return {
             'id': file['id'],
-            'name': file['title'],
+            'name': file['name'],
             'mimeType': file['mimeType'],
-            'size': file.get('fileSize', 'Unknown'),
-            'modifiedDate': file.get('modifiedDate', 'Unknown'),
-            'createdDate': file.get('createdDate', 'Unknown'),
-            'owners': file.get('owners', []),
-            'lastModifyingUser': file.get('lastModifyingUser', {})
+            'size': file.get('size', 'Unknown'),
+            'modifiedDate': file.get('modifiedTime', 'Unknown'),
+            'createdDate': file.get('createdTime', 'Unknown'),
+            'owners': file.get('owners', [])
         }
         
     except Exception as e:
         raise Exception(f"Failed to get metadata for file {file_id}: {str(e)}")
 
-def check_folder_access(drive: GoogleDrive, folder_id: str) -> bool:
+def check_folder_access(service, folder_id: str) -> bool:
     """Check if the service account has access to the specified folder."""
     try:
-        folder = drive.CreateFile({'id': folder_id})
-        folder.FetchMetadata(['title', 'mimeType'])
+        folder = service.files().get(
+            fileId=folder_id,
+            fields='name, mimeType'
+        ).execute()
         
         # Check if it's actually a folder
         if folder['mimeType'] != 'application/vnd.google-apps.folder':
@@ -109,8 +125,6 @@ def check_folder_access(drive: GoogleDrive, folder_id: str) -> bool:
         
     except Exception as e:
         raise Exception(f"Cannot access folder {folder_id}: {str(e)}")
-
-# Additional utility functions for better error handling and logging
 
 def validate_service_account_json(service_account_json: str) -> Dict[str, Any]:
     """Validate and parse service account JSON."""
