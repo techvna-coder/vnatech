@@ -90,28 +90,42 @@ def auth_gate() -> Tuple[bool, str]:
 
     users = auth_cfg.get("users", {})
     if not users:
-        st.error("No users configured under [auth.users]. Please add at least one user with a bcrypt-hashed password.")
+        st.error("No users configured under [auth.users].")
         st.stop()
 
-    names, usernames, hashed_passwords = [], [], []
-    for key, u in users.items():
-        names.append(u.get("name", key))
-        usernames.append(u.get("username", key))
-        hashed_passwords.append(u.get("password", ""))
+    # Build credentials for v0.3.x
+    # chấp nhận 2 kiểu secrets:
+    #  - [auth.users.admin] name=.. username=.. password=..
+    #  - [auth.users.user1] name=.. username=.. password=..
+    credentials = {"usernames": {}}
+    for _, u in users.items():
+        uname = u.get("username")
+        if not uname:
+            continue
+        credentials["usernames"][uname] = {
+            "name": u.get("name", uname),
+            "password": u.get("password", ""),  # bcrypt hash
+        }
 
+    if not credentials["usernames"]:
+        st.error("No valid users in [auth.users]. Each user must have 'username' and 'password' (bcrypt).")
+        st.stop()
+
+    # v0.3.x API:
+    # Authenticate(credentials, cookie_name, key, cookie_expiry_days, preauthorized=None)
     authenticator = stauth.Authenticate(
-        names=names,
-        usernames=usernames,
-        passwords=hashed_passwords,
-        cookie_name=cookie_name,
-        key=cookie_key,
-        cookie_expiry_days=cookie_expiry_days,
+        credentials,
+        cookie_name,
+        cookie_key,
+        cookie_expiry_days
     )
 
-    name, auth_status, username = authenticator.login(location="main", max_login_attempts=3)
+    # login(form_name, location)
+    name, auth_status, username = authenticator.login("Login", "main")
+
     if auth_status:
         with st.sidebar:
-            st.success("Signed in as **%s**" % name)
+            st.success(f"Signed in as **{name}**")
             authenticator.logout("Sign out", "sidebar")
         return True, username
     elif auth_status is False:
@@ -120,7 +134,6 @@ def auth_gate() -> Tuple[bool, str]:
     else:
         st.info("Please sign in to continue.")
         return False, ""
-
 
 # =========================
 # Google Drive Helpers
