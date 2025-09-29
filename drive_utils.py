@@ -1,8 +1,10 @@
-
+# -*- coding: utf-8 -*-
+"""Google Drive helpers for Streamlit (Service Account).
+Minimal, ASCII-only syntax to avoid SyntaxError on older runtimes.
+"""
 import io
 import os
 import time
-from typing import List, Dict, Any, Optional
 
 import streamlit as st
 
@@ -11,91 +13,76 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 
-# ============================
-# Authentication
-# ============================
-
-# Default scopes:
-# - drive: full access (upload/update/list)
-# - drive.readonly: safe fallback for read-only operations (not used by default)
 SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
 @st.cache_resource(show_spinner=False)
 def authenticate_drive():
-    \"\"\"Authenticate to Google Drive using a Service Account from Streamlit secrets.
-    Expected in .streamlit/secrets.toml:
-        GOOGLE_SERVICE_ACCOUNT_JSON = \"\"\"{ ... }\"\"\"  # JSON string
-    \"\"\"
+    """Authenticate using a service account JSON from Streamlit secrets.
+    Expect secrets.GOOGLE_SERVICE_ACCOUNT_JSON (string or dict-like).
+    """
     sa_json = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON", None)
     if not sa_json:
         raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is missing in secrets.")
 
-    # Accept either a JSON string or a dict-like
     if isinstance(sa_json, str):
         import json
         try:
             sa_info = json.loads(sa_json)
         except Exception as e:
-            raise RuntimeError(f"Invalid GOOGLE_SERVICE_ACCOUNT_JSON: {e}")
+            raise RuntimeError("Invalid GOOGLE_SERVICE_ACCOUNT_JSON: %s" % e)
     elif isinstance(sa_json, dict):
         sa_info = sa_json
     else:
         raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON must be a JSON string or dict.")
 
-    # Normalize private_key newlines if provided as escaped \\n
+    # Normalize private_key newlines ("\\n" or "\n" -> newline)
     if "private_key" in sa_info and isinstance(sa_info["private_key"], str):
-        sa_info["private_key"] = sa_info["private_key"].replace("\\\\n", "\n").replace("\\n", "\n")
+        pk = sa_info["private_key"]
+        pk = pk.replace("\\n", "\n")  # collapse escaped backslashes first
+        pk = pk.replace("\n", "\n")    # ensure raw \n stays as two chars in memory
+        pk = pk.encode('utf-8').decode('unicode_escape')
+        sa_info["private_key"] = pk
 
     creds = service_account.Credentials.from_service_account_info(sa_info, scopes=SCOPES)
     service = build("drive", "v3", credentials=creds, cache_discovery=False)
     return service
 
 
-# ============================
-# Helpers
-# ============================
+def _retry(callable_fn, max_tries=3, base_delay=0.8):
+    last_err = None
+    for i in range(max_tries):
+        try:
+            return callable_fn()
+        except Exception as e:
+            last_err = e
+            time.sleep(base_delay * (2 ** i))
+    if last_err:
+        raise last_err
 
-def format_file_size(size_str: Optional[str]) -> str:
+
+def format_file_size(size_str):
     if not size_str:
         return "-"
     try:
         size = int(size_str)
     except Exception:
-        return size_str
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
-        if size < 1024.0:
-            return f"{size:.0f} {unit}"
-        size /= 1024.0
-    return f"{size:.1f} PB"
+        return str(size_str)
+    units = ["B", "KB", "MB", "GB", "TB"]
+    i = 0
+    while size >= 1024 and i < len(units) - 1:
+        size = size / 1024.0
+        i += 1
+    if i == 0:
+        return "%d %s" % (size, units[i])
+    return "%.1f %s" % (size, units[i])
 
 
-def _retry(fn, max_tries: int = 3, base_delay: float = 0.8):
-    last_err = None
-    for attempt in range(1, max_tries + 1):
-        try:
-            return fn()
-        except HttpError as e:
-            last_err = e
-            # exponential backoff
-            time.sleep(base_delay * (2 ** (attempt - 1)))
-        except Exception as e:
-            last_err = e
-            time.sleep(base_delay * (2 ** (attempt - 1)))
-    if last_err:
-        raise last_err
-
-
-# ============================
-# File Listing / Query
-# ============================
-
-def list_files_in_folder(service, folder_id: str) -> List[Dict[str, Any]]:
-    \"\"\"List non-trashed files (id, name, size, mimeType, modifiedTime) within a folder.\"\"\"
-    files: List[Dict[str, Any]] = []
+def list_files_in_folder(service, folder_id):
+    files = []
     page_token = None
-    q = f"'{folder_id}' in parents and trashed = false"
+    q = "'%s' in parents and trashed = false" % folder_id
     fields = "nextPageToken, files(id,name,size,mimeType,modifiedTime)"
     while True:
         def _call():
@@ -108,63 +95,46 @@ def list_files_in_folder(service, folder_id: str) -> List[Dict[str, Any]]:
     return files
 
 
-def _find_file_by_name(service, folder_id: str, filename: str) -> Optional[str]:
-    safe_name = filename.replace("'", "\\'")
-    q = f"'{folder_id}' in parents and name = '{safe_name}' and trashed = false"
+def _find_file_by_name(service, folder_id, filename):
+    safe_name = filename.replace("'", "\'")
+    q = "'%s' in parents and name = '%s' and trashed = false" % (folder_id, safe_name)
     fields = "files(id,name)"
     def _call():
         return service.files().list(q=q, fields=fields, pageSize=1).execute()
     resp = _retry(_call)
     files = resp.get("files", [])
-    return files[0]["id"] if files else None
+    if files:
+        return files[0]["id"]
+    return None
 
 
-# ============================
-# Download
-# ============================
-
-def download_file(service, file_id: str) -> io.BytesIO:
-    \"\"\"Download a Drive file as BytesIO.\"\"\"
+def download_file(service, file_id):
     request = service.files().get_media(fileId=file_id)
     fh = io.BytesIO()
     downloader = MediaIoBaseDownload(fh, request)
     done = False
-
-    def _step():
-        return downloader.next_chunk()
-
     while not done:
+        def _step():
+            return downloader.next_chunk()
         status, done = _retry(_step)
-        # Optional: could display progress in Streamlit if desired
-
     fh.seek(0)
     return fh
 
 
-# ============================
-# Upload (Update-or-Create)
-# ============================
-
-def upload_file(service, folder_id: str, local_path: str, mime_type: str = "application/octet-stream") -> str:
-    \"\"\"Upload a local file to Drive folder. If a file with the same name exists in that folder, update it.
-    Returns the Drive file id.
-    \"\"\"
+def upload_file(service, folder_id, local_path, mime_type="application/octet-stream"):
     filename = os.path.basename(local_path)
     file_id = _find_file_by_name(service, folder_id, filename)
     media = MediaFileUpload(local_path, mimetype=mime_type, resumable=True)
 
     if file_id:
-        # Try update existing file
         try:
-            def _call():
+            def _upd():
                 return service.files().update(fileId=file_id, media_body=media, fields="id").execute()
-            _retry(_call)
+            _retry(_upd)
             return file_id
         except HttpError:
-            # Fall back to create if update is not permitted
             pass
 
-    # Create new file in the folder
     file_metadata = {"name": filename, "parents": [folder_id]}
     def _create():
         return service.files().create(body=file_metadata, media_body=media, fields="id").execute()
