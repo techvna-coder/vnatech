@@ -1,5 +1,4 @@
 import streamlit as st
-from openai import OpenAI
 import numpy as np
 import pandas as pd
 import pickle
@@ -9,12 +8,29 @@ from typing import List, Dict, Any
 import tiktoken
 from io import BytesIO
 
+# Try importing OpenAI
+try:
+    from openai import OpenAI
+except ImportError:
+    st.error("OpenAI library not installed. Please add 'openai>=1.12.0' to requirements.txt")
+    st.stop()
+
 # Import our custom modules
-from drive_utils import authenticate_drive, list_files_in_folder, download_file
-from document_processors import process_pdf, process_pptx, chunk_text, get_embeddings
+try:
+    from drive_utils import authenticate_drive, list_files_in_folder, download_file
+    from document_processors import process_pdf, process_pptx, chunk_text, get_embeddings
+except ImportError as e:
+    st.error(f"Failed to import custom modules: {e}")
+    st.info("Make sure drive_utils.py and document_processors.py are in the same directory as this app.")
+    st.stop()
 
 # Initialize OpenAI client
-client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+try:
+    client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+except Exception as e:
+    st.error(f"Failed to initialize OpenAI client: {e}")
+    st.info("Make sure OPENAI_API_KEY is set in your Streamlit secrets.")
+    st.stop()
 
 # Constants
 DRIVE_FOLDER_ID = st.secrets["DRIVE_FOLDER_ID"]
