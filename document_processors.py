@@ -1,6 +1,7 @@
 import streamlit as st
 from io import BytesIO
 import time
+import re
 from typing import List, Dict, Any, Tuple
 
 # OpenAI (cho embeddings)
@@ -155,21 +156,150 @@ def process_pptx(file_content: BytesIO) -> Tuple[str, Dict[str, Any]]:
     except Exception as e:
         raise Exception(f"Failed to process PPTX: {str(e)}")
 
-# ---------- Chunking ----------
-def _chunk_by_tokens(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
+# ---------- Smart Chunking with Semantic Boundaries ----------
+def _detect_natural_breaks(text: str) -> List[int]:
+    """
+    Phát hiện vị trí các ranh giới tự nhiên trong text:
+    - Dòng trống (paragraph breaks)
+    - Headers (dòng ngắn kết thúc bằng dấu hai chấm hoặc số)
+    - Bullet points
+    - Numbered lists
+    
+    Returns: danh sách các vị trí có thể cắt (character indices)
+    """
+    breaks = [0]  # Bắt đầu
+    lines = text.split('\n')
+    pos = 0
+    
+    for i, line in enumerate(lines):
+        pos += len(line) + 1  # +1 cho \n
+        
+        # Dòng trống - ranh giới mạnh
+        if not line.strip():
+            breaks.append(pos)
+            continue
+        
+        # Header patterns (dòng ngắn kết thúc bằng : hoặc số)
+        if len(line.strip()) < 100:
+            # Kết thúc bằng dấu hai chấm
+            if line.strip().endswith(':'):
+                breaks.append(pos)
+                continue
+            
+            # Bắt đầu bằng số (numbered section)
+            if re.match(r'^\s*\d+[\.\)]\s+', line):
+                breaks.append(pos)
+                continue
+            
+            # Header style: "ATA XX-XX -"
+            if re.match(r'^\s*[A-Z0-9]+-?\s*[A-Z0-9]*\s*-', line):
+                breaks.append(pos)
+                continue
+        
+        # Bullet points
+        if re.match(r'^\s*[-•*]\s+', line):
+            breaks.append(pos)
+            continue
+    
+    breaks.append(len(text))  # Kết thúc
+    return sorted(set(breaks))
+
+def _find_best_split_point(text: str, target_pos: int, window: int = 200) -> int:
+    """
+    Tìm điểm cắt tốt nhất gần target_pos trong khoảng window.
+    Ưu tiên: paragraph break > sentence end > word boundary
+    """
+    start = max(0, target_pos - window)
+    end = min(len(text), target_pos + window)
+    search_zone = text[start:end]
+    
+    # 1. Tìm paragraph break (double newline hoặc single newline với dòng trống)
+    para_breaks = [m.end() for m in re.finditer(r'\n\s*\n', search_zone)]
+    if para_breaks:
+        closest = min(para_breaks, key=lambda x: abs(x - (target_pos - start)))
+        return start + closest
+    
+    # 2. Tìm sentence end (. ! ?) followed by space/newline
+    sent_breaks = [m.end() for m in re.finditer(r'[.!?]\s+', search_zone)]
+    if sent_breaks:
+        closest = min(sent_breaks, key=lambda x: abs(x - (target_pos - start)))
+        return start + closest
+    
+    # 3. Tìm word boundary
+    word_breaks = [m.end() for m in re.finditer(r'\s+', search_zone)]
+    if word_breaks:
+        closest = min(word_breaks, key=lambda x: abs(x - (target_pos - start)))
+        return start + closest
+    
+    # Fallback: cắt tại target_pos
+    return target_pos
+
+def _chunk_by_semantic_boundaries(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
+    """
+    Chunk text theo semantic boundaries thay vì cắt cứng theo token.
+    """
     tokens = _safe_tokenize(text)
+    
     if len(tokens) <= chunk_size:
         return [text]
+    
+    # Lấy các ranh giới tự nhiên
+    natural_breaks = _detect_natural_breaks(text)
+    
     chunks = []
-    start = 0
-    while start < len(tokens):
-        end = min(start + chunk_size, len(tokens))
-        piece = _safe_detokenize(tokens[start:end]).strip()
-        if piece:
-            chunks.append(piece)
-        if end == len(tokens):
+    start_char = 0
+    
+    while start_char < len(text):
+        # Tính vị trí kết thúc mong muốn (theo token)
+        start_tokens = _safe_tokenize(text[:start_char])
+        target_tokens = len(start_tokens) + chunk_size
+        
+        # Tìm vị trí character tương ứng (xấp xỉ)
+        if target_tokens >= len(tokens):
+            end_char = len(text)
+        else:
+            # Binary search để tìm vị trí char tương ứng với token count
+            left, right = start_char, len(text)
+            while left < right:
+                mid = (left + right) // 2
+                mid_tokens = len(_safe_tokenize(text[:mid]))
+                if mid_tokens < target_tokens:
+                    left = mid + 1
+                else:
+                    right = mid
+            end_char = left
+        
+        # Tìm natural break gần nhất
+        natural_candidates = [b for b in natural_breaks if start_char < b <= end_char + 100]
+        if natural_candidates:
+            # Chọn break gần end_char nhất
+            end_char = min(natural_candidates, key=lambda x: abs(x - end_char))
+        else:
+            # Không có natural break, tìm sentence/word boundary
+            end_char = _find_best_split_point(text, end_char, window=150)
+        
+        # Extract chunk
+        chunk_text = text[start_char:end_char].strip()
+        if chunk_text:
+            chunks.append(chunk_text)
+        
+        if end_char >= len(text):
             break
-        start = end - chunk_overlap
+        
+        # Tính overlap theo token
+        overlap_tokens = min(chunk_overlap, len(_safe_tokenize(chunk_text)) // 2)
+        if overlap_tokens > 0:
+            # Lùi lại overlap_tokens
+            overlap_text = _safe_detokenize(_safe_tokenize(chunk_text)[-overlap_tokens:])
+            # Tìm vị trí overlap trong text gốc
+            overlap_pos = text.rfind(overlap_text[:50], start_char, end_char)
+            if overlap_pos > start_char:
+                start_char = overlap_pos
+            else:
+                start_char = end_char
+        else:
+            start_char = end_char
+    
     return chunks
 
 def chunk_text_smart(text: str,
@@ -177,18 +307,17 @@ def chunk_text_smart(text: str,
                      chunk_size: int = 1000,
                      chunk_overlap: int = 200) -> List[Dict[str, Any]]:
     """
-    Tách theo 'đơn vị logic' (Page/Slide) nếu có, sau đó chặt theo token.
-    Trả về list dicts với đầy đủ metadata như streamlit_app.py đang kỳ vọng.
+    Tách theo 'đơn vị logic' (Page/Slide) nếu có, sau đó chunk theo semantic boundaries.
     """
     text = preprocess_text(text)
     sections = []
+    
     # Ưu tiên cắt theo nhãn đã chèn trong extractor
     split_pages = [p for p in text.split("\n--- Page ") if p.strip()]
     split_slides = [s for s in text.split("\n--- Slide ") if s.strip()]
 
     if len(split_pages) > 1:  # PDF
         for blk in split_pages:
-            # blk bắt đầu dạng: "X ---\n<content>" hoặc "X --- <content>"
             try:
                 header, *rest = blk.split("---", 1)
                 number = int(header.strip())
@@ -213,13 +342,13 @@ def chunk_text_smart(text: str,
     total_chunks_counter = 0
     temp_chunks_per_section = []
 
-    # Chunk theo từng section để giữ ngữ cảnh
+    # Chunk theo từng section với semantic boundaries
     for (stype, snum, scontent) in sections:
-        smalls = _chunk_by_tokens(scontent, chunk_size, chunk_overlap)
+        smalls = _chunk_by_semantic_boundaries(scontent, chunk_size, chunk_overlap)
         temp_chunks_per_section.append((stype, snum, smalls))
         total_chunks_counter += len(smalls)
 
-    # Duyệt lần 2 để gán chỉ số chunk toàn cục & metadata đẹp
+    # Duyệt lần 2 để gán chỉ số chunk toàn cục & metadata
     running_idx = 0
     for (stype, snum, smalls) in temp_chunks_per_section:
         for i, txt in enumerate(smalls):
