@@ -8,15 +8,6 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 
-# Deps expected:
-#   bcrypt>=4.0.1
-#   faiss-cpu>=1.7.4
-#   openai>=1.12.0
-#   google-api-python-client>=2.129.0
-#   google-auth>=2.29.0
-#   google-auth-httplib2>=0.2.0
-#   streamlit>=1.31.0
-
 # FAISS
 try:
     import faiss  # type: ignore
@@ -45,9 +36,7 @@ try:
         list_files_in_folder,
         download_file,
         format_file_size,
-        download_embeddings_from_drive,   # keep: chỉ tải về, KHÔNG upload
-        # upload_file,                    # removed (không dùng)
-        # upload_embeddings_to_drive,     # removed (không dùng)
+        download_embeddings_from_drive,
     )
 except Exception as e:
     st.error("Failed to import drive_utils: %s" % e)
@@ -199,28 +188,59 @@ def _load_or_pull_cache_from_drive() -> Tuple[Any, List[Dict[str, Any]]]:
             pass
     return None, None
 
-def _build_or_load_index(process_all: bool = False) -> Tuple[Any, List[Dict[str, Any]]]:
-    # Không ép rebuild thì ưu tiên dùng cache (local → Drive)
-    if not process_all:
-        idx, meta = _load_or_pull_cache_from_drive()
-        if idx is not None and meta is not None:
-            return idx, meta
+def _get_processed_file_ids(meta: List[Dict[str, Any]]) -> set:
+    """Trích xuất tất cả file_id đã có trong metadata"""
+    if not meta:
+        return set()
+    return {item.get("file_id") for item in meta if item.get("file_id")}
 
-    # Build mới từ tài liệu trên Drive
+def _build_or_load_index(process_all: bool = False) -> Tuple[Any, List[Dict[str, Any]]]:
+    """
+    Xây dựng hoặc load index.
+    - Nếu process_all=False: load cache và chỉ xử lý file mới
+    - Nếu process_all=True: rebuild hoàn toàn từ đầu
+    """
     service = _drive_service()
     files = _list_drive_files()
+    
+    # Nếu không ép rebuild, thử dùng cache
+    existing_index = None
+    existing_meta = []
+    processed_ids = set()
+    
+    if not process_all:
+        existing_index, existing_meta = _load_or_pull_cache_from_drive()
+        if existing_index is not None and existing_meta is not None:
+            processed_ids = _get_processed_file_ids(existing_meta)
+            st.info(f"📦 Đã load {len(existing_meta)} chunks từ {len(processed_ids)} files có sẵn")
 
-    all_vectors = []
-    all_meta: List[Dict[str, Any]] = []
+    # Lọc file mới (chưa xử lý)
+    new_files = [f for f in files if f["id"] not in processed_ids]
+    
+    if not new_files and existing_index is not None:
+        st.success("✅ Không có file mới. Sử dụng index hiện tại.")
+        return existing_index, existing_meta
+    
+    if new_files:
+        st.info(f"🔄 Phát hiện {len(new_files)} file mới cần xử lý")
+    
+    # Xử lý file mới
+    new_vectors = []
+    new_meta: List[Dict[str, Any]] = []
 
-    progress = st.progress(0.0, text="Processing documents...")
-    n = max(len(files), 1)
-    for i, f in enumerate(files, start=1):
+    progress = st.progress(0.0, text="Processing new documents...")
+    n = max(len(new_files), 1)
+    
+    for i, f in enumerate(new_files, start=1):
         file_id = f["id"]
         file_name = f["name"]
-        progress.progress(i / n, text="Downloading %s" % file_name)
+        progress.progress(i / n, text="Processing %s (%d/%d)" % (file_name, i, len(new_files)))
 
-        content: BytesIO = download_file(service, file_id)
+        try:
+            content: BytesIO = download_file(service, file_id)
+        except Exception as e:
+            st.warning("Failed to download '%s': %s" % (file_name, e))
+            continue
 
         try:
             if file_name.lower().endswith(".pdf"):
@@ -235,6 +255,7 @@ def _build_or_load_index(process_all: bool = False) -> Tuple[Any, List[Dict[str,
 
         chunks = chunk_text_smart(text, meta, chunk_size=1000, chunk_overlap=200)
         texts = [c["text"] for c in chunks]
+        
         try:
             vecs = get_embeddings(texts, batch_size=100)
         except Exception as e:
@@ -242,26 +263,44 @@ def _build_or_load_index(process_all: bool = False) -> Tuple[Any, List[Dict[str,
             continue
 
         for j, c in enumerate(chunks):
-            all_vectors.append(vecs[j])
+            new_vectors.append(vecs[j])
             row = {"file_id": file_id, "file_name": file_name}
             row.update(c)
-            all_meta.append(row)
-
-    if not all_vectors:
+            new_meta.append(row)
+    
+    progress.progress(1.0, text="Hoàn thành xử lý file mới")
+    
+    # Merge với index cũ
+    if not new_vectors and not existing_meta:
         st.error("No embeddings were created. Please check your Drive folder and parsers.")
         st.stop()
+    
+    if new_vectors:
+        new_mat = np.array(new_vectors, dtype="float32")
+        faiss.normalize_L2(new_mat)
+        
+        if existing_index is not None and existing_meta:
+            # Merge: thêm vector mới vào index cũ
+            existing_index.add(new_mat)
+            combined_meta = existing_meta + new_meta
+            st.success(f"✅ Đã thêm {len(new_vectors)} chunks mới vào index (tổng: {len(combined_meta)} chunks)")
+            index = existing_index
+            all_meta = combined_meta
+        else:
+            # Tạo index mới
+            index = faiss.IndexFlatIP(new_mat.shape[1])
+            index.add(new_mat)
+            all_meta = new_meta
+            st.success(f"✅ Đã tạo index mới với {len(new_meta)} chunks")
+    else:
+        # Không có file mới, dùng lại index cũ
+        index = existing_index
+        all_meta = existing_meta
 
-    mat = np.array(all_vectors, dtype="float32")
-    faiss.normalize_L2(mat)
-    index = faiss.IndexFlatIP(mat.shape[1])
-    index.add(mat)
-
+    # Lưu cache
     with open(EMBEDDINGS_FILE, "wb") as f:
         pickle.dump(all_meta, f)
     faiss.write_index(index, FAISS_INDEX_FILE)
-
-    # ⛔️ ĐÃ BỎ: upload cache lên Google Drive để tránh lỗi quota SA
-    # (giữ local-only; nếu cần persistence dài hạn, dùng Shared Drive + upload riêng ngoài app)
 
     return index, all_meta
 
@@ -325,30 +364,44 @@ def _ask_llm(client: OpenAI, question: str, chunks: List[Dict[str, Any]]) -> str
 # =========================
 def sidebar_panel(index, meta):
     st.sidebar.header("VNA Techinsight")
-    with st.sidebar.expander("Bộ nhớ đệm", expanded=True):
-        st.write("- **Embeddings**: `%s`" % EMBEDDINGS_FILE)
-        st.write("- **FAISS index**: `%s`" % FAISS_INDEX_FILE)
-        st.write("- **Số chunk**: %s" % (len(meta) if meta else 0))
-        st.caption("Cache hiện được lưu **local-only** trong phiên chạy (không upload lên Drive).")
+    
+    # Thống kê
+    processed_ids = _get_processed_file_ids(meta)
+    with st.sidebar.expander("📊 Thống kê", expanded=True):
+        st.metric("Số files đã xử lý", len(processed_ids))
+        st.metric("Tổng số chunks", len(meta) if meta else 0)
+        st.caption("Cache được lưu **local-only** trong phiên chạy (không upload lên Drive).")
+    
+    st.sidebar.divider()
+    
+    with st.sidebar.expander("🔧 Quản lý Index", expanded=False):
+        st.write("**Embeddings**: `%s`" % EMBEDDINGS_FILE)
+        st.write("**FAISS index**: `%s`" % FAISS_INDEX_FILE)
         st.divider()
+        
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("Xây dựng lại index", use_container_width=True):
-                st.session_state["force_rebuild"] = True
+            if st.button("🔄 Cập nhật (chỉ file mới)", use_container_width=True):
+                st.session_state["force_rebuild"] = False
                 st.rerun()
         with col2:
-            if st.button("Xoá cache (local)", type="secondary", use_container_width=True):
-                try:
-                    if os.path.exists(EMBEDDINGS_FILE):
-                        os.remove(EMBEDDINGS_FILE)
-                    if os.path.exists(FAISS_INDEX_FILE):
-                        os.remove(FAISS_INDEX_FILE)
-                except Exception:
-                    pass
-                st.success("Đã xoá cache local.")
+            if st.button("🔨 Rebuild toàn bộ", type="secondary", use_container_width=True):
+                st.session_state["force_rebuild"] = True
                 st.rerun()
+        
+        if st.button("🗑️ Xoá cache (local)", type="secondary", use_container_width=True):
+            try:
+                if os.path.exists(EMBEDDINGS_FILE):
+                    os.remove(EMBEDDINGS_FILE)
+                if os.path.exists(FAISS_INDEX_FILE):
+                    os.remove(FAISS_INDEX_FILE)
+            except Exception:
+                pass
+            st.success("Đã xoá cache local.")
+            st.rerun()
 
     st.sidebar.divider()
+    
     try:
         files = _list_drive_files()
     except Exception as e:
@@ -356,9 +409,11 @@ def sidebar_panel(index, meta):
         files = []
 
     if files:
-        st.sidebar.subheader("Tài liệu trong Drive")
+        st.sidebar.subheader("📁 Tài liệu trong Drive")
         for f in files[:100]:
-            st.sidebar.caption("• %s (%s)" % (f["name"], format_file_size(f.get("size", ""))))
+            is_new = f["id"] not in processed_ids
+            icon = "🆕" if is_new else "✅"
+            st.sidebar.caption("%s %s (%s)" % (icon, f["name"], format_file_size(f.get("size", ""))))
 
     logout_button()
 
@@ -426,7 +481,7 @@ def main():
 
         with st.expander("Xem chi tiết các đoạn trích"):
             for i, c in enumerate(results, start=1):
-                st.markdown("**%d. %s** — %s %s · Chunk %s/%s · sim=%.3f" % (
+                st.markdown("**%d. %s** – %s %s · Chunk %s/%s · sim=%.3f" % (
                     i,
                     c["file_name"],
                     str(c.get("section_type","?")).title(),
