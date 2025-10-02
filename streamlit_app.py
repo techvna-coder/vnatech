@@ -224,8 +224,8 @@ def _build_or_load_index(process_all: bool = False) -> Tuple[Any, List[Dict[str,
     
     for i, f in enumerate(new_files, start=1):
         file_id = f["id"]
-file_name = f["name"]
-file_mtime = f.get("modifiedTime")
+        file_name = f["name"]
+        file_mtime = f.get("modifiedTime")
         progress.progress(i / n, text="Processing %s (%d/%d)" % (file_name, i, len(new_files)))
 
         try:
