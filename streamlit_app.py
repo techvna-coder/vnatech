@@ -9,6 +9,15 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 
+
+from datetime import datetime, timezone
+
+def _to_epoch(mt: str) -> float:
+    try:
+        return datetime.fromisoformat(mt.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
 # FAISS
 try:
     import faiss
@@ -60,7 +69,7 @@ except Exception as e:
 # =========================
 EMBEDDINGS_FILE = "embeddings_meta.pkl"
 FAISS_INDEX_FILE = "faiss_index.bin"
-TOP_K = 15  # Tăng lên để có nhiều candidates cho reranking
+TOP_K = 10  # Tăng lên để có nhiều candidates cho reranking
 
 st.set_page_config(page_title="VNA Tech", layout="wide")
 
@@ -215,7 +224,8 @@ def _build_or_load_index(process_all: bool = False) -> Tuple[Any, List[Dict[str,
     
     for i, f in enumerate(new_files, start=1):
         file_id = f["id"]
-        file_name = f["name"]
+file_name = f["name"]
+file_mtime = f.get("modifiedTime")
         progress.progress(i / n, text="Processing %s (%d/%d)" % (file_name, i, len(new_files)))
 
         try:
@@ -246,7 +256,7 @@ def _build_or_load_index(process_all: bool = False) -> Tuple[Any, List[Dict[str,
 
         for j, c in enumerate(chunks):
             new_vectors.append(vecs[j])
-            row = {"file_id": file_id, "file_name": file_name}
+            row = {"file_id": file_id, "file_name": file_name, "modified_time": file_mtime}
             row.update(c)
             new_meta.append(row)
     
