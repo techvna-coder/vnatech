@@ -207,6 +207,9 @@ def process_pdf(file_content: BytesIO) -> Tuple[str, Dict[str, Any]]:
             "total_words": sum(p["word_count"] for p in pages),
         }
         
+        # Debug info
+        st.caption(f"✓ PDF: {len(pages)} pages, {meta['total_words']} words, {len(key_terms)} key terms")
+        
         return full_text, meta
         
     except Exception as e:
@@ -390,10 +393,13 @@ def _find_best_split_point(text: str, target_pos: int, window: int = 200) -> int
 
 def _chunk_by_semantic_boundaries(text: str, chunk_size: int, chunk_overlap: int) -> List[str]:
     """Chunk text theo semantic boundaries"""
+    if not text or not text.strip():
+        return []
+    
     tokens = _safe_tokenize(text)
     
     if len(tokens) <= chunk_size:
-        return [text]
+        return [text.strip()] if text.strip() else []
     
     natural_breaks = _detect_natural_breaks(text)
     chunks = []
@@ -425,7 +431,9 @@ def _chunk_by_semantic_boundaries(text: str, chunk_size: int, chunk_overlap: int
             end_char = _find_best_split_point(text, end_char, window=150)
         
         chunk_text = text[start_char:end_char].strip()
-        if chunk_text:
+        
+        # Only add non-empty chunks
+        if chunk_text and len(chunk_text) > 10:  # At least 10 chars
             chunks.append(chunk_text)
         
         if end_char >= len(text):
@@ -433,17 +441,22 @@ def _chunk_by_semantic_boundaries(text: str, chunk_size: int, chunk_overlap: int
         
         # Calculate overlap
         overlap_tokens = min(chunk_overlap, len(_safe_tokenize(chunk_text)) // 2)
-        if overlap_tokens > 0:
-            overlap_text = _safe_detokenize(_safe_tokenize(chunk_text)[-overlap_tokens:])
-            overlap_pos = text.rfind(overlap_text[:50], start_char, end_char)
-            if overlap_pos > start_char:
-                start_char = overlap_pos
+        if overlap_tokens > 0 and chunk_text:
+            chunk_tokens = _safe_tokenize(chunk_text)
+            if len(chunk_tokens) >= overlap_tokens:
+                overlap_text = _safe_detokenize(chunk_tokens[-overlap_tokens:])
+                overlap_pos = text.rfind(overlap_text[:50], start_char, end_char)
+                if overlap_pos > start_char:
+                    start_char = overlap_pos
+                else:
+                    start_char = end_char
             else:
                 start_char = end_char
         else:
             start_char = end_char
     
-    return chunks
+    # Final filter for empty chunks
+    return [c for c in chunks if c and c.strip() and len(c.strip()) > 10]
 
 def chunk_text_smart(text: str,
                      doc_metadata: Dict[str, Any],
@@ -451,6 +464,11 @@ def chunk_text_smart(text: str,
                      chunk_overlap: int = 200) -> List[Dict[str, Any]]:
     """Tách text thông minh theo sections và semantic boundaries"""
     text = preprocess_text(text)
+    
+    if not text or not text.strip():
+        st.warning("Empty document after preprocessing")
+        return []
+    
     sections = []
     
     # Parse sections từ markers
@@ -465,7 +483,8 @@ def chunk_text_smart(text: str,
                 content = rest[0] if rest else ""
             except Exception:
                 number, content = 0, blk
-            sections.append(("page", number, content.strip()))
+            if content.strip():  # Only add non-empty content
+                sections.append(("page", number, content.strip()))
     elif len(split_slides) > 1:  # PPTX
         for blk in split_slides:
             try:
@@ -482,9 +501,15 @@ def chunk_text_smart(text: str,
                 title = lines[0].replace("TITLE:", "").strip()
                 content = lines[1] if len(lines) > 1 else ""
             
-            sections.append(("slide", number, content.strip(), title))
+            if content.strip():  # Only add non-empty content
+                sections.append(("slide", number, content.strip(), title))
     else:
-        sections.append(("document", 0, text, ""))
+        if text.strip():  # Ensure not empty
+            sections.append(("document", 0, text, ""))
+
+    if not sections:
+        st.warning("No sections found in document")
+        return []
 
     out: List[Dict[str, Any]] = []
     total_chunks_counter = 0
@@ -498,14 +523,31 @@ def chunk_text_smart(text: str,
         else:
             stype, snum, scontent, stitle = section_data
         
+        # Skip empty sections
+        if not scontent or not scontent.strip():
+            continue
+            
         smalls = _chunk_by_semantic_boundaries(scontent, chunk_size, chunk_overlap)
-        temp_chunks_per_section.append((stype, snum, stitle, smalls))
-        total_chunks_counter += len(smalls)
+        
+        # Filter out empty chunks
+        smalls = [s for s in smalls if s and s.strip()]
+        
+        if smalls:
+            temp_chunks_per_section.append((stype, snum, stitle, smalls))
+            total_chunks_counter += len(smalls)
+
+    if total_chunks_counter == 0:
+        st.warning("No valid chunks created")
+        return []
 
     # Gán metadata chi tiết cho từng chunk
     running_idx = 0
     for (stype, snum, stitle, smalls) in temp_chunks_per_section:
         for i, txt in enumerate(smalls):
+            # Skip if somehow empty (safety check)
+            if not txt or not txt.strip():
+                continue
+                
             # Phân loại content type
             chunk_structure = _detect_structure_elements(txt)
             content_type = _classify_content_type(txt, chunk_structure)
@@ -514,7 +556,7 @@ def chunk_text_smart(text: str,
             local_terms = _extract_key_terms(txt, top_n=10)
             
             chunk_meta = {
-                "text": txt,
+                "text": txt.strip(),  # Ensure trimmed
                 "chunk_index": running_idx,
                 "total_chunks": total_chunks_counter,
                 "section_type": stype,
@@ -541,11 +583,29 @@ def get_embeddings(texts: List[str], batch_size: int = 100) -> List[List[float]]
     if client is None:
         raise Exception("OpenAI client is not initialized")
     
-    all_embeddings = []
-    total = len(texts)
+    # Filter out empty or invalid texts
+    valid_texts = []
+    text_indices = []
+    for idx, text in enumerate(texts):
+        if text and isinstance(text, str) and text.strip():
+            # Truncate very long texts (OpenAI limit ~8191 tokens)
+            if len(text) > 30000:  # ~8000 tokens roughly
+                text = text[:30000]
+            valid_texts.append(text.strip())
+            text_indices.append(idx)
+    
+    if not valid_texts:
+        st.warning("No valid texts to embed. All texts are empty or invalid.")
+        # Return zero vectors for all
+        return [[0.0] * 1536 for _ in texts]
+    
+    # Create result array with zero vectors
+    all_embeddings = [[0.0] * 1536 for _ in texts]
+    total = len(valid_texts)
     
     for i in range(0, total, batch_size):
-        batch = texts[i:i+batch_size]
+        batch = valid_texts[i:i+batch_size]
+        batch_indices = text_indices[i:i+batch_size]
         
         if total > batch_size:
             progress = min(1.0, (i + len(batch)) / total)
@@ -556,20 +616,29 @@ def get_embeddings(texts: List[str], batch_size: int = 100) -> List[List[float]]
                 model="text-embedding-3-small",
                 input=batch
             )
-            all_embeddings.extend([d.embedding for d in resp.data])
+            # Place embeddings at correct indices
+            for j, emb_data in enumerate(resp.data):
+                original_idx = batch_indices[j]
+                all_embeddings[original_idx] = emb_data.embedding
+                
         except Exception as e:
             st.error(f"Embedding batch {i//batch_size + 1} failed: {e}")
             # Retry individual items in batch
-            for text in batch:
+            for j, text in enumerate(batch):
+                original_idx = batch_indices[j]
                 try:
+                    # Double check text is valid before retry
+                    if not text or not text.strip():
+                        continue
                     resp = client.embeddings.create(
                         model="text-embedding-3-small",
                         input=[text]
                     )
-                    all_embeddings.append(resp.data[0].embedding)
-                except Exception:
-                    # Use zero vector as fallback
-                    all_embeddings.append([0.0] * 1536)
+                    all_embeddings[original_idx] = resp.data[0].embedding
+                except Exception as retry_e:
+                    st.warning(f"Failed to embed text at index {original_idx}: {retry_e}")
+                    # Keep zero vector as fallback
+                    pass
         
         if i + batch_size < total:
             time.sleep(0.1)
